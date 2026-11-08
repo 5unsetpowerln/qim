@@ -10,7 +10,8 @@ in=/run/qim/in
 source "$in/config"
 mapfile -d '' -t argv <"$in/argv"
 
-log() { echo "qim-init: $*" >/dev/console; }
+# fd 2 is the console the kernel gave to PID 1; /dev/console is not in the new root.
+log() { echo "qim-init: $*" >&2; }
 die() {
   log "$*"
   poweroff -f
@@ -22,8 +23,12 @@ exec 9>/dev/vdd || die "cannot open the output disk"
 exec 7>/dev/hvc0 || die "cannot open the audit channel"
 
 # The reader starts from the original root, so nothing in the overlay root
-# that the command sees refers to it or to the channel.
-python3 "$in/audit-reader" 7 9>&- 2>/dev/console &
+# that the command sees refers to it or to the channel. It runs under its own
+# uid with only the capabilities it needs, so that a command that becomes root
+# (but loses CAP_KILL and CAP_SYS_PTRACE, below) cannot signal or trace it.
+reader_caps=+audit_control,+audit_read,+net_admin
+setpriv --reuid=999 --regid=999 --clear-groups --inh-caps="-all,$reader_caps" --ambient-caps="$reader_caps" \
+  python3 "$in/audit-reader" 7 9>&- 2>/dev/console &
 reader=$!
 exec 7>&-
 for _ in $(seq 50); do
@@ -33,6 +38,9 @@ done
 [ "$(auditctl -s | awk '$1 == "pid" {print $2}')" = "$reader" ] || die "the audit reader did not register"
 modprobe overlay || die "cannot load overlay"
 modprobe virtio_net || die "cannot load virtio_net"
+# Nothing may load code into the kernel from now on, and io_uring operations
+# would bypass the syscall audit rules.
+sysctl -q -w kernel.modules_disabled=1 kernel.io_uring_disabled=2 || die "cannot restrict the kernel"
 
 mkdir -p /run/qim/upper-disk /run/qim/root
 mount -t ext4 /dev/vdb /run/qim/upper-disk || die "cannot mount the upper disk"
@@ -44,8 +52,18 @@ exec 8</run/qim/upper-disk/upper
 
 root=/run/qim/root
 mount -t proc proc "$root/proc"
-mount -t sysfs sys "$root/sys"
-mount -t devtmpfs dev "$root/dev"
+# Without CAP_SYS_ADMIN the command cannot remount these, so kernel settings
+# such as kernel.io_uring_disabled stay as set above even for root.
+mount --bind "$root/proc/sys" "$root/proc/sys"
+mount -o remount,bind,ro "$root/proc/sys"
+mount -t sysfs -o ro sys "$root/sys"
+# A minimal /dev without the disks and the audit channel.
+mount -t tmpfs -o mode=0755,nosuid dev "$root/dev"
+for node in null:1:3 zero:1:5 full:1:7 random:1:8 urandom:1:9 tty:5:0; do
+  IFS=: read -r name major minor <<<"$node"
+  mknod -m 666 "$root/dev/$name" c "$major" "$minor"
+done
+ln -s pts/ptmx "$root/dev/ptmx"
 mkdir -p "$root/dev/pts" "$root/dev/shm"
 mount -t devpts -o gid=5,mode=620,ptmxmode=666 devpts "$root/dev/pts"
 mount -t tmpfs -o mode=1777,nosuid,nodev shm "$root/dev/shm"
@@ -76,14 +94,20 @@ for rule in \
   # shellcheck disable=SC2086
   auditctl -a always,exit -F arch=b64 $rule >/dev/null || die "cannot add audit rule: $rule"
 done
+auditctl -e 2 >/dev/null || die "cannot lock the audit configuration"
+
+# Capabilities the command never gets, even as root through sudo: creating
+# device nodes, mounting, loading modules, raw I/O, tracing or signalling
+# other users' processes (the audit reader), changing audit or the network.
+drop=-mknod,-sys_admin,-sys_module,-sys_rawio,-sys_ptrace,-sys_boot,-audit_control,-audit_read,-kill,-net_admin,-net_raw,-mac_admin,-mac_override,-bpf,-perfmon,-syslog,-sys_time
 
 mkdir -p /run/qim/meta
 if [ -n "$QIM_USER" ]; then
   home=$(getent passwd "$QIM_USER" | cut -d: -f6)
-  runner=(setpriv --reuid="$QIM_USER" --regid="$QIM_USER" --init-groups --reset-env)
+  runner=(setpriv --reuid="$QIM_USER" --regid="$QIM_USER" --init-groups --reset-env --bounding-set="$drop")
 else
   home=/root
-  runner=(env -i HOME=/root USER=root LOGNAME=root PATH=/usr/local/sbin:/usr/local/bin:/usr/bin)
+  runner=(setpriv --bounding-set="$drop" env -i HOME=/root USER=root LOGNAME=root PATH=/usr/local/sbin:/usr/local/bin:/usr/bin)
 fi
 cd "$home" || die "no home directory $home"
 log "running: ${argv[*]}"

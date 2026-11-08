@@ -1,8 +1,8 @@
 """Profiles: what a base image contains and how the install command runs."""
 from dataclasses import dataclass
 
-# Packages every guest needs for qim itself (recording, networking, output).
-RUNTIME_PACKAGES = ("base", "linux", "audit", "iproute2", "zstd")
+# Packages every guest needs for qim itself (recording and its reader, networking, output).
+RUNTIME_PACKAGES = ("base", "linux", "audit", "iproute2", "python", "zstd")
 
 
 @dataclass(frozen=True)
