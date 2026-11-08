@@ -1,9 +1,10 @@
 //! Run a command in a crosvm guest built from a base image.
 //!
 //! The guest boots the base image read-only and writes every change into an
-//! overlay whose upper layer lives on a per-run disk. When the command ends, the
-//! guest writes a tar with the run's metadata and the upper layer to the output
-//! disk, which is read back here without trusting its content.
+//! overlay whose upper layer lives on a per-run disk. While the command runs,
+//! the guest writes the audit records to a disk of their own. When the command
+//! ends, the guest writes a tar with the run's metadata and the upper layer to
+//! the output disk. Both disks are read back here without trusting their content.
 
 use std::collections::HashMap;
 use std::ffi::{CString, OsString};
@@ -25,10 +26,19 @@ const INIT: &[u8] = include_bytes!("../guest/init");
 /// The audit reader's file name; it is installed next to the qim executable.
 const READER: &str = "qim-audit-reader";
 
-// The overlay's upper layer and the output disk are sparse; these are limits, not allocations.
+// The overlay's upper layer, the output disk and the audit disk are sparse;
+// these are limits, not allocations.
 const UPPER_DISK_SIZE: u64 = 64 << 30;
 const OUTPUT_DISK_SIZE: u64 = UPPER_DISK_SIZE + (8 << 30);
-const META_FILES: &[&str] = &["meta/exit_code", "meta/command.log", "meta/audit_status", "meta/audit_reader_exit"];
+const AUDIT_DISK_SIZE: u64 = 64 << 30;
+const META_FILES: &[&str] = &[
+    "meta/exit_code",
+    "meta/command.log",
+    "meta/audit_status",
+    "meta/audit_reader_exit",
+    "meta/samples",
+    "meta/dmesg",
+];
 
 /// shlex.quote: a word that the guest's shell reads back as `value`.
 fn shell_quote(value: &str) -> String {
@@ -299,13 +309,13 @@ fn crosvm_args(base: &Path, work: &Path, output_dir: &Path, memory_mib: u64, cpu
         option("path=", work.join("input.tar"), ",ro"),
         "--block".into(),
         option("path=", work.join("output.raw"), ""),
+        // The audit reader writes the records to this disk (/dev/vde) while the command runs.
+        "--block".into(),
+        option("path=", work.join("audit.raw"), ""),
         "--net".into(),
         format!("tap-name={}", network::TAP).into(),
         "--serial".into(),
         option("type=file,path=", output_dir.join("console.log"), ",hardware=serial,console"),
-        // The guest streams audit records to this file while the command runs (/dev/hvc0).
-        "--serial".into(),
-        option("type=file,path=", output_dir.join("audit.log"), ",hardware=virtio-console,num=1"),
         "-p".into(),
         "init=/usr/lib/qim/boot quiet audit=1".into(),
         base.join("vmlinuz").into(),
@@ -342,19 +352,26 @@ pub fn run(
         sparse_file(&work.join("upper.img"), UPPER_DISK_SIZE)?;
         image::run(Command::new("mkfs.ext4").args(["-q", "-L", "qim-upper"]).arg(work.join("upper.img")))?;
         sparse_file(&work.join("output.raw"), OUTPUT_DISK_SIZE)?;
+        sparse_file(&work.join("audit.raw"), AUDIT_DISK_SIZE)?;
         let mut command = Command::new("crosvm");
         command.args(crosvm_args(&base, work, output_dir, memory_mib, cpus));
-        {
+        let waited = {
             let network = network::guest_network(output_dir)?;
             let log_path = output_dir.join("crosvm.log");
             let log = File::create(&log_path).map_err(at(&log_path))?;
             let log_for_stderr = log.try_clone().map_err(at(&log_path))?;
             let mut child = image::spawn(command.stdout(log).stderr(log_for_stderr))?;
-            image::wait(&command, &mut child, Some(Duration::from_secs(timeout + 300)))?;
-            for problem in network.finish() {
-                eprintln!("qim: warning: the network record may be incomplete: {problem}");
+            let waited = image::wait(&command, &mut child, Some(Duration::from_secs(timeout + 300)));
+            if waited.is_ok() {
+                for problem in network.finish() {
+                    eprintln!("qim: warning: the network record may be incomplete: {problem}");
+                }
             }
-        }
+            waited
+        };
+        // The records written so far are kept even when the guest had to be stopped.
+        extract_audit_log(&work.join("audit.raw"), &output_dir.join("audit.log"))?;
+        waited?;
         read_output(&work.join("output.raw"), output_dir)?;
     }
     write_events(output_dir);
@@ -381,6 +398,35 @@ pub fn run(
         .map_err(|_| format!("{}: not an exit status: {exit_code:?}", exit_code_path.display()))?;
     // As a process exit status, only the low 8 bits count.
     Ok(code as u8)
+}
+
+/// Copy the audit records from the audit disk to audit.log.
+///
+/// The guest's reader writes them from the start of the disk and pads its last
+/// block with NULs, and records never contain NUL, so they end at the first NUL
+/// (or at the end of the disk). The guest controls the content, which the
+/// converter parses strictly.
+fn extract_audit_log(raw: &Path, log: &Path) -> Result<(), String> {
+    let source = File::open(raw).map_err(at(raw))?;
+    let target = File::create(log).map_err(at(log))?;
+    copy_until_nul(source, target).map_err(|error| format!("cannot extract {}: {error}", log.display()))
+}
+
+fn copy_until_nul(mut source: impl Read, mut target: impl Write) -> io::Result<()> {
+    let mut buffer = vec![0u8; 1 << 20];
+    loop {
+        let count = match source.read(&mut buffer) {
+            Ok(0) => return Ok(()),
+            Ok(count) => count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        let nul = buffer[..count].iter().position(|&byte| byte == 0);
+        target.write_all(&buffer[..nul.unwrap_or(count)])?;
+        if nul.is_some() {
+            return Ok(());
+        }
+    }
 }
 
 /// A host-side network record of the run; None if it is missing.
@@ -556,12 +602,16 @@ mod tests {
             special("meta/", EntryType::Directory, ""),
             file("meta/exit_code", b"3\n"),
             file("meta/command.log", b"hello\n"),
+            file("meta/samples", b"t=0 backlog=0 lost=0 mem_available_kb=1000\n"),
+            file("meta/dmesg", b"[    0.000000] Linux version\n"),
             special("upper/", EntryType::Directory, ""),
             file("upper/etc/new", b"x"),
             special("upper/etc/gone", EntryType::Char, ""),
         ]);
         assert_eq!(fs::read(output.join("meta/exit_code")).unwrap(), b"3\n");
         assert_eq!(fs::read(output.join("meta/command.log")).unwrap(), b"hello\n");
+        assert_eq!(fs::read(output.join("meta/samples")).unwrap(), b"t=0 backlog=0 lost=0 mem_available_kb=1000\n");
+        assert_eq!(fs::read(output.join("meta/dmesg")).unwrap(), b"[    0.000000] Linux version\n");
         let members = members(&fs::read(output.join("upper.tar")).unwrap());
         assert_eq!(members["upper/etc/new"].data, b"x");
         assert_eq!(members.keys().map(String::as_str).collect::<Vec<_>>(), ["upper", "upper/etc/gone", "upper/etc/new"]);
@@ -718,6 +768,42 @@ mod tests {
     fn missing_status_is_a_problem() {
         let directory = TempDir::new(&std::env::temp_dir()).unwrap();
         assert_eq!(recording_problems(directory.path()).len(), 1);
+    }
+
+    fn until_nul(data: &[u8]) -> Vec<u8> {
+        let mut log = Vec::new();
+        copy_until_nul(data, &mut log).unwrap();
+        log
+    }
+
+    #[test]
+    fn the_audit_log_ends_at_the_first_nul() {
+        assert_eq!(until_nul(b"type=A msg=1\ntype=B msg=2\n\0\0\0type=C msg=3\n\0"), b"type=A msg=1\ntype=B msg=2\n");
+        assert_eq!(until_nul(b"\0type=A msg=1\n"), b"");
+        assert_eq!(until_nul(b""), b"");
+        // A disk full of records has no NUL.
+        assert_eq!(until_nul(b"type=A msg=1\n"), b"type=A msg=1\n");
+    }
+
+    #[test]
+    fn records_longer_than_the_copy_buffer_are_kept_whole() {
+        for length in [1 << 20, (1 << 20) + 5] {
+            let mut data = vec![b'r'; length];
+            data.extend([0; 4096]);
+            data.extend(b"type=C msg=3\n");
+            assert_eq!(until_nul(&data), vec![b'r'; length]);
+        }
+    }
+
+    #[test]
+    fn the_audit_log_is_extracted_from_a_sparse_disk() {
+        let directory = TempDir::new(&std::env::temp_dir()).unwrap();
+        let raw = directory.path().join("audit.raw");
+        sparse_file(&raw, 64 << 20).unwrap();
+        File::options().write(true).open(&raw).unwrap().write_all(b"type=A msg=1\n").unwrap();
+        let log = directory.path().join("audit.log");
+        extract_audit_log(&raw, &log).unwrap();
+        assert_eq!(fs::read(&log).unwrap(), b"type=A msg=1\n");
     }
 
     #[test]
