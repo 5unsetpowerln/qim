@@ -1,0 +1,79 @@
+#!/bin/bash
+# The run's init, started by /usr/lib/qim/boot as PID 1 with /proc, /sys,
+# /dev and /run mounted and the input disk unpacked into /run/qim/in.
+#
+# Disks: vda base image (read-only root), vdb empty ext4 for the overlay's
+# upper layer, vdc input tar, vdd output (a tar is written to it raw).
+set -u
+in=/run/qim/in
+# shellcheck source=/dev/null
+source "$in/config"
+mapfile -d '' -t argv <"$in/argv"
+
+log() { echo "qim-init: $*" >/dev/console; }
+die() {
+  log "$*"
+  poweroff -f
+}
+
+# Opened before the root changes: the output disk and, below, the upper layer.
+exec 9>/dev/vdd || die "cannot open the output disk"
+modprobe overlay || die "cannot load overlay"
+modprobe virtio_net || die "cannot load virtio_net"
+
+mkdir -p /run/qim/upper-disk /run/qim/root
+mount -t ext4 /dev/vdb /run/qim/upper-disk || die "cannot mount the upper disk"
+mkdir -p /run/qim/upper-disk/upper /run/qim/upper-disk/work
+mount -t overlay overlay \
+  -o lowerdir=/,upperdir=/run/qim/upper-disk/upper,workdir=/run/qim/upper-disk/work,metacopy=off,redirect_dir=off,index=off \
+  /run/qim/root || die "cannot mount the overlay"
+exec 8</run/qim/upper-disk/upper
+
+root=/run/qim/root
+mount -t proc proc "$root/proc"
+mount -t sysfs sys "$root/sys"
+mount -t devtmpfs dev "$root/dev"
+mkdir -p "$root/dev/pts" "$root/dev/shm"
+mount -t devpts -o gid=5,mode=620,ptmxmode=666 devpts "$root/dev/pts"
+mount -t tmpfs -o mode=1777,nosuid,nodev shm "$root/dev/shm"
+mount -t tmpfs -o mode=0755,nosuid,nodev run "$root/run"
+mount -t tmpfs -o mode=1777,nosuid,nodev tmp "$root/tmp"
+for link in fd:/proc/self/fd stdin:/proc/self/fd/0 stdout:/proc/self/fd/1 stderr:/proc/self/fd/2; do
+  ln -sfn "${link#*:}" "$root/dev/${link%%:*}"
+done
+
+# pivot_root(".", ".") stacks the old root on the new one; detaching it leaves
+# only the overlay, without creating a directory for the old root in it.
+cd "$root" && pivot_root . . && umount -l . || die "cannot switch to the overlay root"
+cd /
+
+ip link set lo up
+ip addr add "$QIM_ADDRESS" dev eth0
+ip link set eth0 up
+ip route add default via "$QIM_GATEWAY"
+
+mkdir -p /run/qim/meta
+if [ -n "$QIM_USER" ]; then
+  home=$(getent passwd "$QIM_USER" | cut -d: -f6)
+  runner=(setpriv --reuid="$QIM_USER" --regid="$QIM_USER" --init-groups --reset-env)
+else
+  home=/root
+  runner=(env -i HOME=/root USER=root LOGNAME=root PATH=/usr/local/sbin:/usr/local/bin:/usr/bin)
+fi
+cd "$home" || die "no home directory $home"
+log "running: ${argv[*]}"
+timeout --kill-after=10 "$QIM_TIMEOUT" "${runner[@]}" env LANG=C.UTF-8 TERM=dumb "${argv[@]}" \
+  </dev/null >/run/qim/meta/command.log 2>&1
+echo "$?" >/run/qim/meta/exit_code
+cd /
+
+# Stop everything the command left behind so that the upper layer is quiet.
+kill -9 -1 2>/dev/null
+sleep 1
+sync
+tar --create --file=- --numeric-owner --xattrs \
+  --xattrs-include='trusted.overlay.*' --xattrs-include='security.capability' \
+  -C /run/qim meta -C /proc/self/fd/8 --transform='s,^\.,upper,' . >&9 || log "cannot write the output"
+exec 9>&-
+sync
+poweroff -f

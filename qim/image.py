@@ -15,7 +15,9 @@ import stat
 import subprocess
 from pathlib import Path
 
-from qim import profiles
+from qim import network, profiles
+
+GUEST_DIR = Path(__file__).parent / "guest"
 
 ARCHIVE_SERVER = "https://archive.archlinux.org/repos/{date}/$repo/os/$arch"
 REPOSITORIES = ("core", "extra")
@@ -81,6 +83,15 @@ def chroot_mounts(root: Path):
 
 def configure(root: Path, profile: profiles.Profile) -> None:
     (root / "etc/hostname").write_text("qim-guest\n")
+    boot = root / "usr/lib/qim/boot"
+    boot.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(GUEST_DIR / "boot", boot)
+    boot.chmod(0o755)
+    # The gateway answers DNS (network.guest_network), so the guest never needs to change this file.
+    resolv = root / "etc/resolv.conf"
+    if resolv.is_symlink() or resolv.exists():
+        resolv.unlink()
+    resolv.write_text(f"nameserver {network.GATEWAY}\n")
     if profile.user is None:
         return
     run("chroot", root, "useradd", "--create-home", profile.user)
