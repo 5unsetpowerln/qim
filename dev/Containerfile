@@ -1,0 +1,24 @@
+# Development environment for qim: an Arch Linux userland with crosvm,
+# used on non-Arch hosts. Build and run it through dev/podman.
+FROM docker.io/archlinux/archlinux:latest
+
+RUN pacman -Syu --noconfirm --needed \
+        base-devel git sudo \
+        rustup rust-bindgen wayland wayland-protocols dtc libcap \
+        python iproute2 nftables arch-install-scripts e2fsprogs \
+    && pacman -Scc --noconfirm
+
+# makepkg refuses to run as root, so AUR packages are built by this user.
+RUN useradd --create-home builder \
+    && echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
+
+USER builder
+WORKDIR /home/builder
+RUN rustup default stable \
+    && git clone https://aur.archlinux.org/crosvm-git.git \
+    && cd crosvm-git \
+    && makepkg --syncdeps --install --noconfirm \
+    && cd .. && rm -rf crosvm-git ~/.cargo/registry ~/.cargo/git
+
+USER root
+WORKDIR /
