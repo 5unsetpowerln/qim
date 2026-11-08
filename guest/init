@@ -85,6 +85,10 @@ ip addr add "$QIM_ADDRESS" dev eth0
 ip link set eth0 up
 ip route add default via "$QIM_GATEWAY"
 
+# The rules record only processes whose loginuid (auid) is this marker: the
+# command and its descendants (see where the command starts). The init's own
+# steps, the sampler and the reader keep the unset loginuid and are not recorded.
+audit_marker=4242
 auditctl -D >/dev/null
 for rule in \
   "-S execve,execveat -k exec" \
@@ -94,7 +98,7 @@ for rule in \
   "-S clone,clone3,fork,vfork -k proc" \
   "-S connect,sendto,sendmsg,sendmmsg -k net"; do
   # shellcheck disable=SC2086
-  auditctl -a always,exit -F arch=b64 $rule >/dev/null || die "cannot add audit rule: $rule"
+  auditctl -a always,exit -F arch=b64 -F auid="$audit_marker" $rule >/dev/null || die "cannot add audit rule: $rule"
 done
 auditctl -e 2 >/dev/null || die "cannot lock the audit configuration"
 
@@ -136,8 +140,14 @@ sample >/run/qim/meta/samples 2>&1 &
 sampler=$!
 
 log "running: ${argv[*]}"
-timeout --kill-after=10 "$QIM_TIMEOUT" "${runner[@]}" env LANG=C.UTF-8 TERM=dumb "${argv[@]}" \
-  </dev/null >/run/qim/meta/command.log 2>&1
+# The command's first process takes the audit marker as its loginuid. Setting
+# an unset loginuid needs no privilege, but changing a set one needs
+# CAP_AUDIT_CONTROL, which the command's bounding set drops, so the command and
+# every descendant (fork and exec inherit it, sudo keeps it) stay marked.
+(
+  echo "$audit_marker" >/proc/self/loginuid || die "cannot mark the command for audit" 2>/proc/1/fd/2
+  exec timeout --kill-after=10 "$QIM_TIMEOUT" "${runner[@]}" env LANG=C.UTF-8 TERM=dumb "${argv[@]}"
+) </dev/null >/run/qim/meta/command.log 2>&1
 echo "$?" >/run/qim/meta/exit_code
 kill "$sampler" 2>/dev/null
 wait "$sampler"

@@ -75,6 +75,7 @@ fn status_message(pid: u32) -> Vec<u8> {
 
 fn type_name(kind: u16) -> Cow<'static, str> {
     Cow::Borrowed(match kind {
+        1006 => "LOGIN",
         1100 => "USER_AUTH",
         1101 => "USER_ACCT",
         1102 => "USER_MGMT",
