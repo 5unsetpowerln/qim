@@ -1,0 +1,8 @@
+#!/bin/sh
+# Run cargo inside the development container. Build outputs and the cargo
+# cache stay in build/, never in the user's home directory.
+set -eu
+repo=$(cd "$(dirname "$0")/.." && pwd)
+exec "$repo/dev/podman" run --rm -v "$repo:/src" -w /src \
+  -e CARGO_HOME=/src/build/cargo-home -e CARGO_TARGET_DIR=/src/build/target \
+  qim-dev cargo "$@"
