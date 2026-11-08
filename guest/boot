@@ -1,0 +1,14 @@
+#!/bin/sh
+# Installed in the base image as /usr/lib/qim/boot and started by the kernel
+# as init. It only loads this run's init from the input disk (/dev/vdc), so
+# that the init can change without rebuilding the image.
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+mount -t tmpfs -o mode=0755,nosuid,nodev run /run
+mkdir -p /run/qim/in
+if ! tar -xf /dev/vdc -C /run/qim/in; then
+  echo "qim-boot: cannot read the input disk" >/dev/console
+  poweroff -f
+fi
+exec /bin/bash /run/qim/in/init
