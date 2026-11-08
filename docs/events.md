@@ -248,10 +248,12 @@ keeps two more records while the guest runs, outside the guest's reach:
   `SERVFAIL`, ...) or `RCODE<n>`, or null if no answer came back; `answers`
   holds the A and AAAA addresses (text as for socket addresses) and the
   CNAME targets of the answer section.
-- `packets.log`: written by qim's capture on the tap device, one JSON object
-  per line and per packet from the guest that starts or attempts a flow: a
-  TCP segment with SYN and without ACK, any UDP datagram, an ICMP or ICMPv6
-  echo request, or any other IP protocol:
+- `packets.log`: written by qim's capture on the tap device. It considers
+  the packets from the guest that start or attempt a flow (a TCP segment with
+  SYN and without ACK, any UDP datagram, an ICMP or ICMPv6 echo request, or
+  any other IP protocol) and writes each distinct object once, in the order
+  of first occurrence, one JSON object per line (so retransmissions and
+  repeated datagrams do not make it grow):
   `{"protocol": "tcp"|"udp"|"icmp"|"icmpv6"|"ip<n>", "family": "inet"|"inet6",
   "address": "<destination>", "port": <destination port or null>}`.
 
