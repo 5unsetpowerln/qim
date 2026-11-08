@@ -16,6 +16,14 @@ pub struct Profile {
     pub sudo_commands: &'static [&'static str],
     /// Shell script run at image build time as `user` inside the image root, with network.
     pub setup: &'static str,
+    /// Files added to the image after `setup`, as (guest path, content).
+    pub files: &'static [(&'static str, &'static str)],
+    /// Directories created in the image after `setup`, owned by `user` (root if None).
+    pub user_dirs: &'static [&'static str],
+    /// Path patterns (docs/diff.md): an added or modified file is an artifact
+    /// when it matches one of `include` and none of `exclude`.
+    pub include: &'static [&'static str],
+    pub exclude: &'static [&'static str],
 }
 
 impl Profile {
@@ -42,6 +50,20 @@ pub const PROFILES: &[Profile] = &[
         user: None,
         sudo_commands: &[],
         setup: "",
+        files: &[],
+        user_dirs: &[],
+        include: &["/**"],
+        exclude: &[
+            "/tmp/**",
+            "/var/tmp/**",
+            "/run/**",
+            "/var/cache/**",
+            "/var/log/**",
+            "/root/.cache/**",
+            "/home/*/.cache/**",
+            "/var/lib/pacman/sync/**",
+            "/etc/ld.so.cache",
+        ],
     },
     // makepkg refuses to run as root, and paru only needs root to call pacman.
     Profile {
@@ -50,6 +72,11 @@ pub const PROFILES: &[Profile] = &[
         user: Some("qim"),
         sudo_commands: &["/usr/bin/pacman"],
         setup: AUR_SETUP,
+        // makepkg puts the packages it builds (debug packages included) where the artifacts are taken from.
+        files: &[("/etc/makepkg.conf.d/qim.conf", "PKGDEST=/var/lib/qim/packages\n")],
+        user_dirs: &["/var/lib/qim/packages"],
+        include: &["/var/lib/qim/packages/*.pkg.tar.zst"],
+        exclude: &[],
     },
 ];
 

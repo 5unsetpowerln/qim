@@ -358,6 +358,23 @@ fn configure(root: &Path, profile: &Profile) -> Result<(), String> {
     Ok(())
 }
 
+/// Add the profile's files and directories. This comes after the setup script
+/// so that they do not affect it: with the aur profile's PKGDEST, the package
+/// built for paru would otherwise stay in the image.
+fn add_profile_files(root: &Path, profile: &Profile) -> Result<(), String> {
+    for (path, contents) in profile.files {
+        let target = root.join(path.trim_start_matches('/'));
+        let parent = target.parent().expect("a path below root");
+        fs::create_dir_all(parent).map_err(at(parent))?;
+        write(&target, contents)?;
+    }
+    let user = profile.user.unwrap_or("root");
+    for directory in profile.user_dirs {
+        run(chroot(root).args(["install", "-d", "-m", "0755", "-o", user, "-g", user, directory]))?;
+    }
+    Ok(())
+}
+
 /// root/usr/lib/modules/*/vmlinuz, sorted.
 fn kernels(root: &Path) -> Result<Vec<PathBuf>, String> {
     let mut kernels: Vec<PathBuf> = list_dir(&root.join("usr/lib/modules"))?
@@ -420,6 +437,7 @@ pub fn build(profile_name: &str, date: Date, name: Option<&str>) -> Result<PathB
         if !profile.setup.is_empty() {
             run_setup(&root, profile)?;
         }
+        add_profile_files(&root, profile)?;
     }
 
     let kernels = kernels(&root)?;
@@ -461,7 +479,7 @@ pub fn build(profile_name: &str, date: Date, name: Option<&str>) -> Result<PathB
 
 // --- Manifest --------------------------------------------------------------------
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Kind {
     Dir,
     File { size: u64, sha256: String },
@@ -505,6 +523,66 @@ impl Entry {
         }
         object(fields)
     }
+
+    fn from_json(json: &Json) -> Result<Entry, String> {
+        let Json::Object(fields) = json else {
+            return Err("an entry is not an object".to_string());
+        };
+        let field = |key: &str| {
+            let found = fields.iter().find(|(name, _)| name == key.as_bytes());
+            found.map(|(_, value)| value).ok_or_else(|| format!("an entry has no {key}"))
+        };
+        let string = |key: &str| match field(key)? {
+            Json::Str(value) => Ok(value.as_slice()),
+            _ => Err(format!("{key} is not a string")),
+        };
+        let number = |key: &str| match field(key)? {
+            Json::Int(value) => Ok(*value),
+            _ => Err(format!("{key} is not a number")),
+        };
+        let id = |key: &str| number(key).and_then(|value| u32::try_from(value).map_err(|_| format!("{key} is too large")));
+        let kind = match string("type")? {
+            b"dir" => Kind::Dir,
+            b"file" => {
+                let sha256 = String::from_utf8(string("sha256")?.to_vec()).map_err(|_| "sha256 is not hexadecimal")?;
+                Kind::File { size: number("size")?, sha256 }
+            }
+            b"symlink" => Kind::Symlink { target: string("target")?.to_vec() },
+            b"other" => Kind::Other,
+            other => return Err(format!("unknown type {:?}", String::from_utf8_lossy(other))),
+        };
+        let mode = std::str::from_utf8(string("mode")?).ok().and_then(|mode| u32::from_str_radix(mode, 8).ok());
+        let xattrs = match fields.iter().find(|(name, _)| name == b"xattrs") {
+            None => Vec::new(),
+            Some((_, Json::Object(xattrs))) => xattrs
+                .iter()
+                .map(|(name, value)| match value {
+                    Json::Str(value) => unhex(value).map(|value| (name.clone(), value)),
+                    _ => None,
+                })
+                .collect::<Option<_>>()
+                .ok_or("an xattr value is not hexadecimal")?,
+            Some(_) => return Err("xattrs is not an object".to_string()),
+        };
+        Ok(Entry {
+            path: string("path")?.to_vec(),
+            kind,
+            mode: mode.ok_or("mode is not octal")?,
+            uid: id("uid")?,
+            gid: id("gid")?,
+            xattrs,
+        })
+    }
+}
+
+/// Read a manifest.json written by `build`.
+pub fn read_manifest(path: &Path) -> Result<Vec<Entry>, String> {
+    let invalid = |problem: String| format!("{}: {problem}", path.display());
+    let Json::List(items) = parse_json(&fs::read(path).map_err(at(path))?).map_err(invalid)? else {
+        return Err(invalid("not a list".to_string()));
+    };
+    let entry = |(index, item)| Entry::from_json(item).map_err(|problem| invalid(format!("entry {index}: {problem}")));
+    items.iter().enumerate().map(entry).collect()
 }
 
 /// Every path under `root` with its type, metadata and content hash, sorted by path.
@@ -556,11 +634,20 @@ fn file_sha256(path: &Path, buffer: &mut [u8]) -> Result<String, String> {
     }
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut out, byte| {
         let _ = write!(out, "{byte:02x}");
         out
     })
+}
+
+fn unhex(text: &[u8]) -> Option<Vec<u8>> {
+    let digit = |byte: u8| char::from(byte).to_digit(16);
+    let pairs = text.chunks(2).map(|pair| match pair {
+        &[high, low] => Some((digit(high)? << 4 | digit(low)?) as u8),
+        _ => None,
+    });
+    pairs.collect()
 }
 
 /// The extended attributes of `path` (following a final symlink), sorted by name.
@@ -601,6 +688,9 @@ fn sized(call: impl Fn(*mut u8, usize) -> isize) -> io::Result<Vec<u8>> {
 }
 
 // --- JSON as Python's json module writes it ----------------------------------------
+//
+// json_file writes it and parse_json reads it back, with the strings as the
+// bytes they were decoded from.
 
 /// The characters Python decodes a file name to: UTF-8, with each undecodable
 /// byte mapped to U+DC80..U+DCFF (surrogateescape).
@@ -673,6 +763,153 @@ fn write_json(out: &mut String, value: &Json, indent: usize, depth: usize) {
         newline(out, depth);
     }
     out.push(close);
+}
+
+/// Parse a document as json_file writes it (objects, lists, strings and
+/// non-negative integers), decoding each string back to its bytes: the
+/// inverse of python_chars, so a lone U+DC80..U+DCFF is the byte 0x80..0xFF.
+fn parse_json(input: &[u8]) -> Result<Json, String> {
+    let mut parser = JsonParser { input, position: 0 };
+    let value = parser.value()?;
+    parser.skip_whitespace();
+    if parser.position < input.len() {
+        return Err(parser.error("trailing data"));
+    }
+    Ok(value)
+}
+
+struct JsonParser<'a> {
+    input: &'a [u8],
+    position: usize,
+}
+
+impl JsonParser<'_> {
+    fn error(&self, problem: &str) -> String {
+        format!("invalid JSON at byte {}: {problem}", self.position)
+    }
+
+    fn skip_whitespace(&mut self) {
+        while self.input.get(self.position).is_some_and(|byte| b" \t\n\r".contains(byte)) {
+            self.position += 1;
+        }
+    }
+
+    fn next_byte(&mut self) -> Option<u8> {
+        let byte = self.input.get(self.position).copied();
+        self.position += usize::from(byte.is_some());
+        byte
+    }
+
+    fn next_token(&mut self) -> Option<u8> {
+        self.skip_whitespace();
+        self.next_byte()
+    }
+
+    fn value(&mut self) -> Result<Json, String> {
+        match self.next_token() {
+            Some(b'[') => self.items(b']', Self::value).map(Json::List),
+            Some(b'{') => self.items(b'}', Self::field).map(Json::Object),
+            Some(b'"') => self.string().map(Json::Str),
+            Some(digit @ b'0'..=b'9') => {
+                let mut number = u64::from(digit - b'0');
+                while let Some(&digit @ b'0'..=b'9') = self.input.get(self.position) {
+                    let next = number.checked_mul(10).and_then(|number| number.checked_add(u64::from(digit - b'0')));
+                    number = next.ok_or_else(|| self.error("number out of range"))?;
+                    self.position += 1;
+                }
+                Ok(Json::Int(number))
+            }
+            _ => Err(self.error("expected a value")),
+        }
+    }
+
+    fn field(&mut self) -> Result<(Vec<u8>, Json), String> {
+        if self.next_token() != Some(b'"') {
+            return Err(self.error("expected a key"));
+        }
+        let key = self.string()?;
+        if self.next_token() != Some(b':') {
+            return Err(self.error("expected ':'"));
+        }
+        Ok((key, self.value()?))
+    }
+
+    /// The items of a list or object, after its opening bracket.
+    fn items<T>(&mut self, close: u8, item: impl Fn(&mut Self) -> Result<T, String>) -> Result<Vec<T>, String> {
+        let mut items = Vec::new();
+        self.skip_whitespace();
+        if self.input.get(self.position) == Some(&close) {
+            self.position += 1;
+            return Ok(items);
+        }
+        loop {
+            items.push(item(self)?);
+            match self.next_token() {
+                Some(b',') => {}
+                Some(byte) if byte == close => return Ok(items),
+                _ => return Err(self.error("expected ',' or the closing bracket")),
+            }
+        }
+    }
+
+    /// The rest of a string, after its opening quote.
+    fn string(&mut self) -> Result<Vec<u8>, String> {
+        let mut bytes = Vec::new();
+        loop {
+            let unescaped = match self.next_byte().ok_or_else(|| self.error("unterminated string"))? {
+                b'"' => return Ok(bytes),
+                b'\\' => match self.next_byte() {
+                    Some(b'u') => {
+                        self.unicode_escape(&mut bytes)?;
+                        continue;
+                    }
+                    Some(b'b') => 0x08,
+                    Some(b'f') => 0x0C,
+                    Some(b'n') => b'\n',
+                    Some(b'r') => b'\r',
+                    Some(b't') => b'\t',
+                    Some(byte @ (b'"' | b'\\' | b'/')) => byte,
+                    _ => return Err(self.error("invalid escape")),
+                },
+                byte => byte,
+            };
+            bytes.push(unescaped);
+        }
+    }
+
+    fn hex_unit(&mut self) -> Result<u32, String> {
+        let digits = self.input.get(self.position..self.position + 4);
+        let unit = digits.and_then(|digits| {
+            digits.iter().try_fold(0, |unit, &byte| Some(unit << 4 | char::from(byte).to_digit(16)?))
+        });
+        let unit = unit.ok_or_else(|| self.error("invalid \\u escape"))?;
+        self.position += 4;
+        Ok(unit)
+    }
+
+    /// A \u escape, after the "\u": a character, a surrogate pair, or a lone
+    /// U+DC80..U+DCFF standing for an undecodable byte.
+    fn unicode_escape(&mut self, bytes: &mut Vec<u8>) -> Result<(), String> {
+        let unit = self.hex_unit()?;
+        let code = match unit {
+            0xD800..=0xDBFF if self.input[self.position..].starts_with(b"\\u") => {
+                self.position += 2;
+                let low = self.hex_unit()?;
+                if !(0xDC00..=0xDFFF).contains(&low) {
+                    return Err(self.error("unpaired surrogate"));
+                }
+                0x10000 + ((unit - 0xD800) << 10) + (low - 0xDC00)
+            }
+            0xDC80..=0xDCFF => {
+                bytes.push((unit - 0xDC00) as u8);
+                return Ok(());
+            }
+            unit => unit,
+        };
+        let character = char::from_u32(code).ok_or_else(|| self.error("unpaired surrogate"))?;
+        bytes.extend_from_slice(character.encode_utf8(&mut [0; 4]).as_bytes());
+        Ok(())
+    }
 }
 
 /// A JSON string with ensure_ascii, escaped exactly as Python's json module does.
@@ -771,6 +1008,58 @@ mod tests {
             }, 0o644),
             entry("/l", Kind::Symlink { target: b"d/f".to_vec() }, 0o777),
         ]);
+    }
+
+    #[test]
+    fn manifest_json_reads_back_to_the_entries_it_was_written_from() {
+        let entries = vec![
+            Entry {
+                path: b"/caf\xc3\xa9 \"q\" \\ \x7f \x01\n\t\xf0\x90\x82\x80\xf0\x9f\x98\x80 \xff \xed\xa0\x80".to_vec(),
+                kind: Kind::File { size: 3, sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into() },
+                mode: 0o4755,
+                uid: 1000,
+                gid: 4_000_000_000,
+                xattrs: vec![(b"security.capability".to_vec(), vec![1, 0, 0, 2, 0xff])],
+            },
+            Entry { path: b"/d".to_vec(), kind: Kind::Dir, mode: 0o1777, uid: 0, gid: 0, xattrs: Vec::new() },
+            Entry { path: b"/l".to_vec(), kind: Kind::Symlink { target: b"\xfe/x".to_vec() }, mode: 0o777, uid: 0, gid: 0, xattrs: Vec::new() },
+            Entry { path: b"/o".to_vec(), kind: Kind::Other, mode: 0o600, uid: 0, gid: 0, xattrs: Vec::new() },
+        ];
+        let directory = TempDir::new(&std::env::temp_dir()).unwrap();
+        let path = directory.path().join("manifest.json");
+        fs::write(&path, json_file(&Json::List(entries.iter().map(Entry::to_json).collect()), 1)).unwrap();
+        assert_eq!(read_manifest(&path).unwrap(), entries);
+    }
+
+    #[test]
+    fn manifest_strings_decode_escapes_to_bytes() {
+        // A lone U+DC80..U+DCFF is an undecodable byte; a surrogate pair is one character.
+        let document = "[{\"gid\": 0, \"mode\": \"0755\", \"path\": \"/a\\udcff\\ud83d\\ude00\\u00e9\\n\\/\", \"type\": \"dir\", \"uid\": 0}]";
+        let Json::List(items) = parse_json(document.as_bytes()).unwrap() else { panic!("not a list") };
+        let entry = Entry::from_json(&items[0]).unwrap();
+        assert_eq!(entry.path, b"/a\xff\xf0\x9f\x98\x80\xc3\xa9\n/");
+    }
+
+    #[test]
+    fn invalid_manifest_json_is_rejected() {
+        for document in [
+            "[{\"path\": \"/a\\ud83d\"}]",
+            "[{\"path\": \"/a\\udc00\"}]",
+            "[{\"path\": \"/a\\u12\"}]",
+            "[{\"path\": \"/a\"}] x",
+            "[{\"path\": \"/a\"},]",
+            "[{\"path\" \"/a\"}]",
+            "[-1]",
+            "[18446744073709551616]",
+            "[\"unterminated]",
+        ] {
+            assert!(parse_json(document.as_bytes()).is_err(), "{document}");
+        }
+        let entry = |fields: &str| parse_json(format!("{{{fields}}}").as_bytes()).map(|json| Entry::from_json(&json));
+        assert!(entry("\"gid\": 0, \"mode\": \"0755\", \"path\": \"/a\", \"type\": \"dir\", \"uid\": 0").unwrap().is_ok());
+        assert!(entry("\"gid\": 0, \"mode\": \"0758\", \"path\": \"/a\", \"type\": \"dir\", \"uid\": 0").unwrap().is_err());
+        assert!(entry("\"gid\": 0, \"mode\": \"0755\", \"path\": \"/a\", \"type\": \"file\", \"uid\": 0").unwrap().is_err());
+        assert!(entry("\"gid\": 0, \"mode\": \"0755\", \"path\": \"/a\", \"type\": \"dir\", \"uid\": 4294967296").unwrap().is_err());
     }
 
     #[test]

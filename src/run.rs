@@ -5,7 +5,6 @@
 //! guest writes a tar with the run's metadata and the upper layer to the output
 //! disk, which is read back here without trusting its content.
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ffi::{CString, OsString};
 use std::fs::{self, File};
@@ -17,6 +16,7 @@ use std::time::Duration;
 
 use tar::{EntryType, Header};
 
+use crate::guest_tar::{self, Records};
 use crate::image::{self, at};
 use crate::{audit, network, profiles};
 
@@ -81,69 +81,54 @@ pub fn read_output(raw: &Path, output_dir: &Path) -> Result<(), String> {
     let upper_file = File::create(&upper_path).map_err(at(&upper_path))?;
     let mut upper = TarWriter::new(BufWriter::with_capacity(1 << 20, upper_file));
     let source = File::open(raw).map_err(at(raw))?;
-    let mut source = tar::Archive::new(BufReader::with_capacity(1 << 20, source));
-    let failed = |error: io::Error| format!("cannot read the guest output: {error}");
-    for entry in source.entries().map_err(failed)? {
+    let mut source = guest_tar::Reader::new(BufReader::with_capacity(1 << 20, source));
+    let failed = |error: String| format!("cannot read the guest output: {error}");
+    while let Some((member, mut data)) = source.next_member().map_err(failed)? {
         image::check_signal()?;
-        let mut entry = entry.map_err(failed)?;
-        let name = entry.path_bytes().into_owned();
-        let meta = META_FILES.iter().find(|meta| meta.as_bytes() == name.as_slice());
+        let meta = META_FILES.iter().find(|meta| meta.as_bytes() == member.name.as_slice());
         if let Some(meta) = meta
-            && is_regular(entry.header().entry_type())
+            && member.is_regular()
         {
             let target = meta_dir.join(&meta["meta/".len()..]);
             let mut file = File::create(&target).map_err(at(&target))?;
-            io::copy(&mut entry, &mut file).map_err(failed)?;
-        } else if name == b"upper" || name.starts_with(b"upper/") {
-            copy_member(&mut upper, &mut entry).map_err(failed)?;
+            io::copy(&mut data, &mut file).map_err(|error| failed(error.to_string()))?;
+        } else if member.name == b"upper" || member.name.starts_with(b"upper/") {
+            copy_member(&mut upper, &member, data).map_err(|error| failed(error.to_string()))?;
         }
     }
     upper.finish().map_err(at(&upper_path))?;
     Ok(())
 }
 
-/// tarfile's REGULAR_TYPES: the members whose data is file content.
-fn is_regular(kind: EntryType) -> bool {
-    matches!(kind, EntryType::Regular | EntryType::Continuous | EntryType::GNUSparse)
-}
-
 /// Copy a member of the guest's upper layer into upper.tar, keeping what
 /// tarfile keeps: the name, metadata, link target, device numbers, the pax
-/// records (which carry the xattrs) and, for regular files, the content.
-fn copy_member<R: Read, W: Write>(upper: &mut TarWriter<W>, entry: &mut tar::Entry<R>) -> io::Result<()> {
-    let source = entry.header().clone();
-    let regular = is_regular(source.entry_type());
-    // The content of a sparse member is read back expanded.
-    let kind = if source.entry_type().is_gnu_sparse() { EntryType::Regular } else { source.entry_type() };
-    let mut name = entry.path_bytes().into_owned();
-    if kind.is_dir() && !name.ends_with(b"/") {
+/// records (which carry the xattrs, byte for byte) and, for regular files,
+/// the content.
+fn copy_member<W: Write>(upper: &mut TarWriter<W>, member: &guest_tar::Member, data: impl Read) -> io::Result<()> {
+    let mut name = member.name.clone();
+    if member.kind.is_dir() && !name.ends_with(b"/") {
         name.push(b'/');
     }
-    let link_name = entry.link_name_bytes().map(Cow::into_owned);
-    let mut records: PaxRecords = match entry.pax_extensions()? {
-        Some(extensions) => extensions
-            .map(|record| record.map(|record| (record.key_bytes().to_vec(), record.value_bytes().to_vec())))
-            .collect::<io::Result<_>>()?,
-        None => Vec::new(),
-    };
-    // Only regular members have data, whatever the guest claims in the size field.
-    let size = if regular { entry.size() } else { 0 };
-    let mut header = ustar_header(kind, source.mode()? & 0o7777, size);
-    header.set_uid(source.uid()?);
-    header.set_gid(source.gid()?);
-    header.set_mtime(source.mtime()?);
+    // Only regular members have data, whatever the guest claims in the size
+    // field or record; the header holds any size, so no size record is kept.
+    let size = if member.is_regular() { member.size } else { 0 };
+    let mut records: Records = member.records.iter().filter(|(key, _)| key != b"size").cloned().collect();
+    let mut header = ustar_header(member.kind, member.mode & 0o7777, size);
+    header.set_uid(member.uid);
+    header.set_gid(member.gid);
+    header.set_mtime(member.mtime);
     set_field(&mut header.as_old_mut().name, &name, b"path", &mut records);
-    if let Some(link_name) = &link_name {
-        set_field(&mut header.as_old_mut().linkname, link_name, b"linkpath", &mut records);
+    if !member.link_name.is_empty() {
+        set_field(&mut header.as_old_mut().linkname, &member.link_name, b"linkpath", &mut records);
     }
     let ustar = header.as_ustar_mut().expect("a ustar header");
-    set_field(&mut ustar.uname, source.username_bytes().unwrap_or_default(), b"uname", &mut records);
-    set_field(&mut ustar.gname, source.groupname_bytes().unwrap_or_default(), b"gname", &mut records);
-    if matches!(kind, EntryType::Char | EntryType::Block) {
-        header.set_device_major(source.device_major()?.unwrap_or(0))?;
-        header.set_device_minor(source.device_minor()?.unwrap_or(0))?;
+    set_field(&mut ustar.uname, &member.uname, b"uname", &mut records);
+    set_field(&mut ustar.gname, &member.gname, b"gname", &mut records);
+    if matches!(member.kind, EntryType::Char | EntryType::Block) {
+        header.set_device_major(member.device.0)?;
+        header.set_device_minor(member.device.1)?;
     }
-    upper.append(header, &records, entry)
+    upper.append(header, &records, data)
 }
 
 // --- Writing tar streams as Python's tarfile writes them (PAX_FORMAT) ---------------
@@ -152,8 +137,6 @@ const BLOCK_SIZE: u64 = 512;
 /// tarfile pads an archive to a whole number of records.
 const RECORD_SIZE: u64 = 20 * BLOCK_SIZE;
 const PAX_HEADER_NAME: &[u8] = b"././@PaxHeader";
-
-type PaxRecords = Vec<(Vec<u8>, Vec<u8>)>;
 
 /// A ustar header with every numeric field written, as tarfile writes them.
 fn ustar_header(kind: EntryType, mode: u32, size: u64) -> Header {
@@ -169,7 +152,7 @@ fn ustar_header(kind: EntryType, mode: u32, size: u64) -> Header {
 
 /// Put `value` into a fixed-size header field, and into a pax record under
 /// `key` when it does not fit or is not ASCII, as tarfile does.
-fn set_field(field: &mut [u8], value: &[u8], key: &[u8], records: &mut PaxRecords) {
+fn set_field(field: &mut [u8], value: &[u8], key: &[u8], records: &mut Records) {
     let length = value.len().min(field.len());
     field[..length].copy_from_slice(&value[..length]);
     let representable = value.len() <= field.len() && value.is_ascii();
@@ -375,6 +358,10 @@ pub fn run(
         read_output(&work.join("output.raw"), output_dir)?;
     }
     write_events(output_dir);
+    // Like events.json, a diff that cannot be derived only warns.
+    if let Err(error) = crate::diff::write(output_dir, &base.join("manifest.json"), profile) {
+        eprintln!("qim: warning: cannot write diff.json and the artifacts: {error}");
+    }
     let exit_code_path = output_dir.join("meta/exit_code");
     let exit_code = match fs::read(&exit_code_path) {
         Ok(exit_code) => exit_code,
@@ -475,43 +462,29 @@ mod tests {
         kind: EntryType,
         mode: u32,
         data: Vec<u8>,
-        records: PaxRecords,
+        records: Records,
         link_name: Option<Vec<u8>>,
         device: Option<(u32, u32)>,
     }
 
     /// The members of a tar, by name as tarfile reports it (directories without the trailing slash).
     fn members(data: &[u8]) -> BTreeMap<String, Member> {
-        let mut archive = tar::Archive::new(data);
+        let mut reader = guest_tar::Reader::new(data);
         let mut members = BTreeMap::new();
-        for entry in archive.entries().unwrap() {
-            let mut entry = entry.unwrap();
-            let name = String::from_utf8(entry.path_bytes().into_owned()).unwrap();
-            let header = entry.header().clone();
-            let records = match entry.pax_extensions().unwrap() {
-                Some(records) => records
-                    .map(|record| record.map(|record| (record.key_bytes().to_vec(), record.value_bytes().to_vec())))
-                    .collect::<io::Result<_>>()
-                    .unwrap(),
-                None => Vec::new(),
-            };
-            let link_name = entry.link_name_bytes().map(Cow::into_owned);
+        while let Some((member, mut data)) = reader.next_member().unwrap() {
             let mut content = Vec::new();
-            entry.read_to_end(&mut content).unwrap();
-            let device = match header.entry_type() {
-                EntryType::Char | EntryType::Block => {
-                    Some((header.device_major().unwrap().unwrap(), header.device_minor().unwrap().unwrap()))
-                }
-                _ => None,
-            };
-            let member = Member { kind: header.entry_type(), mode: header.mode().unwrap(), data: content, records, link_name, device };
-            members.insert(name.trim_end_matches('/').to_string(), member);
+            data.read_to_end(&mut content).unwrap();
+            let name = String::from_utf8(member.name.clone()).unwrap();
+            let device = matches!(member.kind, EntryType::Char | EntryType::Block).then_some(member.device);
+            let link_name = (!member.link_name.is_empty()).then(|| member.link_name.clone());
+            let records = member.records;
+            members.insert(name.trim_end_matches('/').to_string(), Member { kind: member.kind, mode: member.mode, data: content, records, link_name, device });
         }
         members
     }
 
     /// A tar of (name, type, data, link name, pax records).
-    fn tar_bytes(entries: &[(&str, EntryType, &[u8], &str, PaxRecords)]) -> Vec<u8> {
+    fn tar_bytes(entries: &[(&str, EntryType, &[u8], &str, Records)]) -> Vec<u8> {
         let mut archive = TarWriter::new(Vec::new());
         for (name, kind, data, link_name, records) in entries {
             let mut records = records.clone();
@@ -527,11 +500,11 @@ mod tests {
         archive.finish().unwrap()
     }
 
-    fn file<'a>(name: &'a str, data: &'static [u8]) -> (&'a str, EntryType, &'static [u8], &'static str, PaxRecords) {
+    fn file<'a>(name: &'a str, data: &'static [u8]) -> (&'a str, EntryType, &'static [u8], &'static str, Records) {
         (name, EntryType::Regular, data, "", Vec::new())
     }
 
-    fn special<'a>(name: &'a str, kind: EntryType, link_name: &'static str) -> (&'a str, EntryType, &'static [u8], &'static str, PaxRecords) {
+    fn special<'a>(name: &'a str, kind: EntryType, link_name: &'static str) -> (&'a str, EntryType, &'static [u8], &'static str, Records) {
         (name, kind, b"", link_name, Vec::new())
     }
 
@@ -565,7 +538,7 @@ mod tests {
         assert_eq!(shell_quote("a b'c"), "'a b'\"'\"'c'");
     }
 
-    fn read(entries: &[(&str, EntryType, &[u8], &str, PaxRecords)]) -> (TempDir, PathBuf) {
+    fn read(entries: &[(&str, EntryType, &[u8], &str, Records)]) -> (TempDir, PathBuf) {
         let directory = TempDir::new(&std::env::temp_dir()).unwrap();
         let raw = directory.path().join("raw");
         let mut bytes = tar_bytes(entries);
@@ -637,6 +610,77 @@ mod tests {
         assert!(long.records.contains(&xattr));
         assert!(long.records.contains(&(b"hdrcharset".to_vec(), b"BINARY".to_vec())));
         assert_eq!(members["upper/link"].link_name.as_deref(), Some(&b"../target"[..]));
+    }
+
+    /// read_output on a guest stream written by hand.
+    fn read_stream(bytes: &[u8]) -> Result<(TempDir, PathBuf), String> {
+        let directory = TempDir::new(&std::env::temp_dir()).unwrap();
+        let raw = directory.path().join("raw");
+        fs::write(&raw, bytes).unwrap();
+        let output = directory.path().join("out");
+        fs::create_dir(&output).unwrap();
+        read_output(&raw, &output).map(|()| (directory, output))
+    }
+
+    #[test]
+    fn binary_xattr_values_are_copied_byte_for_byte() {
+        use guest_tar::testing::{header, member, pax, stream};
+        let origin = b"46 SCHILY.xattr.trusted.overlay.origin=\x00\xfb\n\x00\xff\n\n";
+        let capability = b"41 SCHILY.xattr.security.capability=\x01\n\x00\xff\n";
+        let bytes = stream(&[
+            pax(origin),
+            member(header(b'5', b"upper/etc/", 0), b""),
+            pax(capability),
+            member(header(b'0', b"upper/usr/bin/ping", 3), b"abc"),
+        ]);
+        let (_directory, output) = read_stream(&bytes).unwrap();
+        let members = members(&fs::read(output.join("upper.tar")).unwrap());
+        // The values are not UTF-8, so the writer declares hdrcharset=BINARY first.
+        let binary = (b"hdrcharset".to_vec(), b"BINARY".to_vec());
+        assert_eq!(members["upper/etc"].records, [
+            binary.clone(),
+            (b"SCHILY.xattr.trusted.overlay.origin".to_vec(), b"\x00\xfb\n\x00\xff\n".to_vec())
+        ]);
+        assert_eq!(members["upper/usr/bin/ping"].records, [
+            binary,
+            (b"SCHILY.xattr.security.capability".to_vec(), b"\x01\n\x00\xff".to_vec())
+        ]);
+        assert_eq!(members["upper/usr/bin/ping"].data, b"abc");
+    }
+
+    #[test]
+    fn a_size_record_is_applied_and_not_copied() {
+        use guest_tar::testing::{header, member, pax, stream};
+        let mut link = header(b'2', b"upper/l", 0);
+        link.as_old_mut().linkname[..1].copy_from_slice(b"f");
+        let bytes = stream(&[
+            pax(b"10 size=3\n"),
+            member(header(b'0', b"upper/f", 0), b"abc"),
+            // A symlink has no content in upper.tar, whatever size the guest gives it.
+            pax(b"10 size=5\n"),
+            member(link, b"xxxxx"),
+            member(header(b'0', b"upper/g", 2), b"de"),
+        ]);
+        let (_directory, output) = read_stream(&bytes).unwrap();
+        let members = members(&fs::read(output.join("upper.tar")).unwrap());
+        assert_eq!(members.keys().map(String::as_str).collect::<Vec<_>>(), ["upper/f", "upper/g", "upper/l"]);
+        assert_eq!((members["upper/f"].data.as_slice(), members["upper/f"].records.as_slice()), (&b"abc"[..], &[][..]));
+        assert_eq!((members["upper/l"].data.as_slice(), members["upper/l"].records.as_slice()), (&b""[..], &[][..]));
+        assert_eq!(members["upper/l"].link_name.as_deref(), Some(&b"f"[..]));
+        assert_eq!(members["upper/g"].data, b"de");
+    }
+
+    #[test]
+    fn an_unreadable_guest_output_is_an_error() {
+        use guest_tar::testing::{header, member, pax, stream};
+        let file = || member(header(b'0', b"upper/f", 0), b"");
+        for (members, problem) in [
+            (vec![member(header(b'g', b"pax_global_header", 0), b""), file()], "global pax headers are not supported"),
+            (vec![member(header(b'S', b"upper/f", 0), b"")], "GNU sparse members are not supported"),
+            (vec![pax(b"12 path=/x\n"), file()], "malformed pax record \"12 path=/x\\n\""),
+        ] {
+            assert_eq!(read_stream(&stream(&members)).err(), Some(format!("cannot read the guest output: {problem}")));
+        }
     }
 
     #[test]
