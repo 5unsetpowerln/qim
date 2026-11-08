@@ -3,7 +3,8 @@
 `events.json` summarizes what happened inside the guest while the install
 command ran: which programs were executed, which network destinations were
 contacted, and which files were accessed. It is derived from the Linux audit
-log recorded inside the guest.
+log recorded inside the guest and from the DNS and packet records kept by the
+host (see "Host-side network records").
 
 ## Determinism
 
@@ -231,6 +232,38 @@ that has a `SOCKADDR` record yields one entry:
 `family`, `address`, `port`, `ok` and `errno` form one entry with the sorted
 list of their process ids.
 
+## Host-side network records
+
+The guest's audit record attributes network sends to processes, but it can
+miss destinations (one `SOCKADDR` per syscall, so `sendmmsg` keeps only one)
+and a command that gains root could interfere with it. The host therefore
+keeps two more records while the guest runs, outside the guest's reach:
+
+- `dns.log`: written by qim's DNS forwarder on the gateway address, to which
+  all guest traffic to port 53 is redirected. One JSON object per line and
+  per query: `{"name": "<qname>", "type": "<qtype>", "rcode": "<rcode>",
+  "answers": ["<address or name>", ...]}`. `name` is the query name in lower
+  case without the trailing dot; `type` is the mnemonic (`A`, `AAAA`, `CNAME`,
+  `HTTPS`, ...) or `TYPE<n>`; `rcode` is the mnemonic (`NOERROR`, `NXDOMAIN`,
+  `SERVFAIL`, ...) or `RCODE<n>`, or null if no answer came back; `answers`
+  holds the A and AAAA addresses (text as for socket addresses) and the
+  CNAME targets of the answer section.
+- `packets.log`: written by qim's capture on the tap device, one JSON object
+  per line and per packet from the guest that starts or attempts a flow: a
+  TCP segment with SYN and without ACK, any UDP datagram, an ICMP or ICMPv6
+  echo request, or any other IP protocol:
+  `{"protocol": "tcp"|"udp"|"icmp"|"icmpv6"|"ip<n>", "family": "inet"|"inet6",
+  "address": "<destination>", "port": <destination port or null>}`.
+
+From them the converter derives:
+
+- `dns`: the distinct `dns.log` objects, with `answers` sorted and
+  deduplicated.
+- `wire`: the distinct `packets.log` objects.
+
+A missing log yields an empty list. A line that is not a JSON object with
+exactly these keys and value types is rejected.
+
 ## Document
 
     {
@@ -238,6 +271,8 @@ list of their process ids.
       "processes": [ {"id", "parent", "exe", "argv", "cwd"}, ... ],
       "files": [ ... ],
       "network": [ ... ],
+      "dns": [ ... ],
+      "wire": [ ... ],
       "counts": {"syscall_events": N, "ignored_records": N, "unresolved_paths": N}
     }
 
@@ -254,10 +289,12 @@ list of their process ids.
   `json.dumps(entry, sort_keys=True, ensure_ascii=False, separators=(",", ":"))`.
 - `network`: by (`family`, `address` or "", `port` or -1, `syscall`, `ok`
   false before true, `errno` or "", canonical JSON).
+- `dns`: by (`name`, `type`, canonical JSON).
+- `wire`: by (`family`, `address`, `port` or -1, `protocol`).
 
 ## Worked example
 
-Input (fields not used by the converter are omitted):
+Input (only an audit log; fields not used by the converter are omitted):
 
     type=SYSCALL msg=audit(1.000:10): arch=c000003e syscall=59 success=yes exit=0 a0=0 a1=0 a2=0 a3=0 items=1 ppid=1 pid=100 comm="sh" exe="/usr/bin/sh"
     type=EXECVE msg=audit(1.000:10): argc=3 a0="sh" a1="-c" a2="x"
@@ -297,6 +334,7 @@ Output:
 
     {
       "counts": {"ignored_records": 1, "syscall_events": 8, "unresolved_paths": 1},
+      "dns": [],
       "files": [
         {"errno": null, "ok": true, "op": "read", "path": "/etc", "processes": [2]},
         {"errno": null, "ok": true, "op": "create", "path": "/etc/out", "processes": [2]},
@@ -316,7 +354,8 @@ Output:
         {"argv": ["sh", "-c", "x"], "cwd": "/root", "exe": "/usr/bin/sh", "id": 1, "parent": null},
         {"argv": ["cat", "a.txt"], "cwd": "/root", "exe": "/usr/bin/cat", "id": 2, "parent": 1}
       ],
-      "schema_version": 1
+      "schema_version": 1,
+      "wire": []
     }
 
 (The output is shown compacted; the real serialization uses `indent=2`.)
