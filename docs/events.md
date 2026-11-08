@@ -22,25 +22,34 @@ is one record:
 
     type=<TYPE> msg=audit(<seconds>.<millis>:<serial>): <key>=<value> ...
 
-- Records with the same serial belong to one event.
-- A syscall event consists of a `SYSCALL` record, optionally `EXECVE`, `CWD`,
+- Records of the types `SYSCALL`, `EXECVE`, `CWD`, `PATH`, `SOCKADDR` and
+  `PROCTITLE` with the same serial belong to one syscall event. An event
+  consists of one `SYSCALL` record, optionally `EXECVE` (one or more), `CWD`,
   `PATH` (zero or more) and `SOCKADDR` records, and ends with a `PROCTITLE`
   record. There are no `EOE` records. Records of different events may
   interleave, so records must be grouped by serial, not by position.
-- Events are processed in ascending numeric order of their serial.
-- Records of other types (`USER_*`, `CRED_*`, `CONFIG_CHANGE`, `DAEMON_*`,
-  `MAC_*`, ...) are ignored and only counted.
+- Records of all other types (`USER_*`, `CRED_*`, `CONFIG_CHANGE`,
+  `DAEMON_*`, `MAC_*`, `UNKNOWN[...]`, ...) are not grouped; they are only
+  counted, even when they share a serial with a syscall event.
+- Events are processed in ascending numeric order of their serial. The serial
+  is assigned when the kernel emits the event (at syscall exit), so records
+  can arrive out of serial order. An input in which a record with serial `s`
+  appears after a record with serial `s + 10000` or larger (the reorder
+  window) is rejected, as are malformed lines.
 - A value is either a double-quoted string (taken literally without the
   quotes), the literal `(null)`, or an unquoted token. In `EXECVE`, `PATH`
-  `name` and `CWD` `cwd`, an unquoted token that is not `(null)` is the
-  hexadecimal encoding of the bytes. Decoded bytes are converted to text as
+  `name`, `CWD` `cwd` and `SYSCALL` `exe`, an unquoted token that is not
+  `(null)` is the hexadecimal encoding of the bytes. A `CWD` of `(null)`
+  counts as a missing `CWD`. Decoded bytes are converted to text as
   UTF-8 with `errors="backslashreplace"`.
 - `SYSCALL` fields used: `syscall` (decimal, x86_64 numbers), `success`
   (`yes`/`no`), `exit` (decimal), `a0`..`a3` (hexadecimal without `0x`),
   `pid`, `ppid` (decimal), `exe` (string).
-- `EXECVE`: `argc` and `a0`, `a1`, ... . A long argument `aN` is split into
-  `aN_len=<len>` followed by chunks `aN[0]`, `aN[1]`, ...; the chunks are
-  concatenated in index order before decoding.
+- `EXECVE`: `argc` and `a0`, `a1`, ... . The arguments of a long command
+  line are spread over several `EXECVE` records of the same event, in order.
+  A long argument `aN` is split into `aN_len=<len>` followed by chunks
+  `aN[0]`, `aN[1]`, ...; the chunks are concatenated in index order before
+  decoding.
 - `PATH`: `item` (decimal), `name`, `nametype` (`NORMAL`, `PARENT`, `CREATE`,
   `DELETE`, `UNKNOWN`).
 - `SOCKADDR`: `saddr`, the raw `struct sockaddr` as hexadecimal.
@@ -52,12 +61,23 @@ is one record:
 A process image is created by every successful `execve` (59) or `execveat`
 (322). Images get integer ids 1, 2, 3, ... in the order of their exec events.
 
-The converter keeps `current[pid]`, the image currently attributed to a pid:
+The converter keeps, per pid, the image currently attributed to it
+(`current[pid]`), its fd table (below), and the `ppid` and serial of the first
+event seen from that pid since its state was last reset (`origin[pid]`).
 
+- The first event from a pid without state creates an empty state with that
+  event's `ppid` and serial as its origin.
 - After a successful exec by `pid`, `current[pid]` is the new image.
-- After a successful `clone` (56), `clone3` (435), `fork` (57) or `vfork` (58)
-  whose `exit` is a positive child pid `c`, `current[c] = current[pid]` (if
-  `pid` has an image).
+- A successful `clone` (56), `clone3` (435), `fork` (57) or `vfork` (58) at
+  serial `S` in pid `p` whose `exit` is a positive child pid `c`:
+  - If `c` already has state whose origin has `ppid == p` and a serial `o`
+    with `S - 10000 < o < S`, the child already ran before its creation was
+    logged (with `CLONE_VFORK` the parent's clone only exits after the
+    child's exec, so the child's events get smaller serials). Its state is
+    kept; only fds missing from its table are copied from `p`'s table.
+  - Otherwise (no state, or state left by an earlier process with the same
+    pid) the state of `c` is reset: `current[c] = current[p]` (none if `p` has
+    none), its fd table becomes a copy of `p`'s, and its origin is `(p, S)`.
 
 Each image records:
 
@@ -76,7 +96,9 @@ image; otherwise `current[pid]`, else `current[ppid]`, else null.
 
 ### Path resolution
 
-For every `PATH` record whose `nametype` is not `PARENT`:
+`PATH` records with `nametype` `PARENT` and records whose `name` is `(null)`
+(the kernel's anonymous references) produce no file events and are skipped
+everywhere below. For every other `PATH` record:
 
 1. If `name` is absolute, it is used as is.
 2. Otherwise the base directory depends on the syscall and the record:
@@ -84,15 +106,16 @@ For every `PATH` record whose `nametype` is not `PARENT`:
      argument: `a0` for `openat` (257), `openat2` (437), `mkdirat` (258),
      `unlinkat` (263) and `execveat` (322); for `renameat` (264),
      `renameat2` (316) and `linkat` (265) it is `a0` for the source record
-     (`nametype` `DELETE` or `NORMAL`) and `a2` for the destination record
-     (`nametype` `CREATE`); for `symlinkat` (266) it is `a1`.
+     and `a2` for the other records (see "Two-path syscalls"); for
+     `symlinkat` (266) it is `a1`.
      If that argument is `AT_FDCWD`, the base is the event's `CWD`.
      Otherwise the base is the path the fd table (below) maps that fd to.
    - For all other syscalls the base is the event's `CWD`.
    - The resolved path is `base + "/" + name`.
-3. The path is normalized lexically: repeated slashes are collapsed and `.`
-   components are removed. `..` components are kept (resolving them lexically
-   is wrong when symlinks are involved).
+3. The path is normalized lexically: repeated slashes are collapsed, `.`
+   components and a trailing slash are removed (a path that becomes empty is
+   `/`). `..` components are kept (resolving them lexically is wrong when
+   symlinks are involved).
 
 If the base is unknown (an fd the converter has no mapping for, or a missing
 `CWD`), the path is unresolved: the file event gets `"path": null` and
@@ -108,12 +131,16 @@ unknown), updated by successful syscalls only:
   fd; it maps to the resolved path of the first non-`PARENT` `PATH` record
   (unknown if unresolved).
 - `close` (3): remove `a0`. `close_range` (436): remove every fd from `a0` to
-  `a1` inclusive.
+  `a1` inclusive (as unsigned 32-bit numbers), unless `a2` has
+  `CLOSE_RANGE_CLOEXEC` (0x4), which closes nothing immediately.
 - `dup` (32): `exit` maps to what `a0` maps to. `dup2` (33), `dup3` (292):
   `a1` maps to what `a0` maps to. `fcntl` (72) with `a1` equal to 0
   (`F_DUPFD`) or 0x406 (`F_DUPFD_CLOEXEC`): `exit` maps to what `a0` maps to.
-- `clone`, `clone3`, `fork`, `vfork` with positive `exit` `c`: the table of
-  `c` becomes a copy of the table of `pid`.
+- `clone`, `clone3`, `fork`, `vfork` with positive `exit` `c`: see
+  "Processes" (the child's table is replaced by or completed from `pid`'s).
+
+File descriptor arguments (`a0` of `close`, `dup*`, `fcntl` and the `*at`
+directory arguments) are the low 32 bits of the register as a signed integer.
 
 Known limitations, accepted in version 1: `O_CLOEXEC` is not applied at exec,
 `CLONE_FILES` sharing is treated as a copy, and fds received over
@@ -131,12 +158,19 @@ Each non-`PARENT` `PATH` record yields one or more file events, each with an
 | `unlink` (87), `unlinkat` (263) | `delete`; `unlinkat` with `AT_REMOVEDIR` (0x200) in `a2` gives `rmdir` |
 | `rmdir` (84) | `rmdir` |
 | `mkdir` (83), `mkdirat` (258) | `mkdir` |
-| `rename` (82), `renameat` (264), `renameat2` (316) | `rename_from` for `nametype` `DELETE` or `NORMAL`, `rename_to` for `CREATE` |
-| `link` (86), `linkat` (265) | `link_source` for `NORMAL`, `link` for `CREATE` |
+| `rename` (82), `renameat` (264), `renameat2` (316) | see "Two-path syscalls" |
+| `link` (86), `linkat` (265) | see "Two-path syscalls" |
 | `symlink` (88), `symlinkat` (266) | `symlink` |
 
 Other syscalls (`close`, `dup*`, `fcntl`, `chdir`, `fchdir`, `clone*`,
 `connect`, ...) yield no file events.
+
+Two-path syscalls (`rename`, `renameat`, `renameat2`, `link`, `linkat`): the
+first remaining record (lowest `item`) is the source and gets `rename_from`
+or `link_source`. Each later record with `nametype` `CREATE` is the
+destination and gets `rename_to` or `link`. Each later record with
+`nametype` `DELETE` is a destination that the call replaced and gets
+`delete`. Any other later record gets the destination op.
 
 Open flags are `a1` for `open`, `a2` for `openat`; `creat` behaves like
 `O_WRONLY|O_CREAT|O_TRUNC`; for `openat2` the flags are not in the record and
@@ -144,17 +178,21 @@ the op is `open`. From the flags:
 
 - `O_PATH` (0x200000): only `path`.
 - Otherwise by `flags & 3`: 0 gives `read`, 1 gives `write`, 2 gives `read`
-  and `write`.
+  and `write`, 3 gives `open`.
 - In addition, `create` if the record's `nametype` is `CREATE`, and `truncate`
   if `O_TRUNC` (0x200) is set.
 
 ### Entry
 
-    {"path": "/etc/out", "op": "write", "ok": true, "errno": null, "process": 2}
+    {"path": "/etc/out", "op": "write", "ok": true, "errno": null, "processes": [2]}
 
-`ok` is `success == "yes"`. `errno` is null when `ok`, otherwise the symbolic
-name of `-exit` (as in Python's `errno.errorcode`), or the decimal number as a
-string if it has no name. Identical entries are reported once.
+`ok` is `success == "yes"`. `errno` is null when `ok`, otherwise the Linux
+x86-64 name of `-exit` from the table in `qim/errnos.py` (which uses the
+kernel's primary names: `EAGAIN`, `EDEADLK`, `EOPNOTSUPP`), or the decimal
+number as a string if it has no name. File events with the same path (or the
+same `unresolved` value), `op`, `ok` and `errno` form one entry, whose
+`processes` is the sorted list of the distinct process ids of those events
+(events attributed to no process add nothing).
 
 ## Network events
 
@@ -162,7 +200,7 @@ Every `connect` (42), `sendto` (44), `sendmsg` (46) or `sendmmsg` (307) event
 that has a `SOCKADDR` record yields one entry:
 
     {"syscall": "connect", "family": "inet", "address": "169.254.1.1",
-     "port": 53, "ok": true, "errno": null, "process": 2}
+     "port": 53, "ok": true, "errno": null, "processes": [2]}
 
 `saddr` is decoded by its first two bytes (little-endian family):
 
@@ -172,12 +210,15 @@ that has a `SOCKADDR` record yields one entry:
 - 2, `inet`: `port` is bytes 2-3 big-endian, `address` bytes 4-7 in dotted
   form.
 - 10, `inet6`: `port` is bytes 2-3 big-endian, `address` bytes 8-23 in the
-  compressed form of Python's `ipaddress.IPv6Address`.
+  text form of RFC 5952, with IPv4-mapped addresses written as
+  `::ffff:a.b.c.d` (as Python 3.13 and later print them).
 - 16, `netlink`: `address` and `port` are null.
 - other: `family` is `af<number>`, `address` is the full `saddr` hex in lower
   case, `port` is null.
 
-`ok`/`errno` are as for file events. Identical entries are reported once.
+`ok`/`errno` are as for file events. Events with the same `syscall`,
+`family`, `address`, `port`, `ok` and `errno` form one entry with the sorted
+list of their process ids.
 
 ## Document
 
@@ -197,11 +238,11 @@ that has a `SOCKADDR` record yields one entry:
 
 - `processes`: by `id`.
 - `files`: by the tuple (resolved entries before unresolved ones, `path` or
-  "", `op`, `process` or -1, `ok` false before true, `errno` or "", canonical
-  JSON of the entry), where canonical JSON is
+  "", `op`, `ok` false before true, `errno` or "", canonical JSON of the
+  entry), where canonical JSON is
   `json.dumps(entry, sort_keys=True, ensure_ascii=False, separators=(",", ":"))`.
-- `network`: by (`family`, `address` or "", `port` or -1, `syscall`,
-  `process` or -1, `ok` false before true, `errno` or "", canonical JSON).
+- `network`: by (`family`, `address` or "", `port` or -1, `syscall`, `ok`
+  false before true, `errno` or "", canonical JSON).
 
 ## Worked example
 
@@ -246,19 +287,19 @@ Output:
     {
       "counts": {"ignored_records": 1, "syscall_events": 8, "unresolved_paths": 1},
       "files": [
-        {"errno": null, "ok": true, "op": "read", "path": "/etc", "process": 2},
-        {"errno": null, "ok": true, "op": "create", "path": "/etc/out", "process": 2},
-        {"errno": null, "ok": true, "op": "truncate", "path": "/etc/out", "process": 2},
-        {"errno": null, "ok": true, "op": "write", "path": "/etc/out", "process": 2},
-        {"errno": null, "ok": true, "op": "read", "path": "/root/a.txt", "process": 2},
-        {"errno": null, "ok": true, "op": "exec", "path": "/usr/bin/cat", "process": 2},
-        {"errno": null, "ok": true, "op": "exec", "path": "/usr/bin/sh", "process": 1},
-        {"errno": "ENOENT", "ok": false, "op": "delete", "path": null, "process": 2,
+        {"errno": null, "ok": true, "op": "read", "path": "/etc", "processes": [2]},
+        {"errno": null, "ok": true, "op": "create", "path": "/etc/out", "processes": [2]},
+        {"errno": null, "ok": true, "op": "truncate", "path": "/etc/out", "processes": [2]},
+        {"errno": null, "ok": true, "op": "write", "path": "/etc/out", "processes": [2]},
+        {"errno": null, "ok": true, "op": "read", "path": "/root/a.txt", "processes": [2]},
+        {"errno": null, "ok": true, "op": "exec", "path": "/usr/bin/cat", "processes": [2]},
+        {"errno": null, "ok": true, "op": "exec", "path": "/usr/bin/sh", "processes": [1]},
+        {"errno": "ENOENT", "ok": false, "op": "delete", "path": null, "processes": [2],
          "unresolved": {"dirfd": 7, "name": "zz"}}
       ],
       "network": [
         {"address": "169.254.1.1", "errno": null, "family": "inet", "ok": true,
-         "port": 53, "process": 2, "syscall": "connect"}
+         "port": 53, "processes": [2], "syscall": "connect"}
       ],
       "processes": [
         {"argv": ["sh", "-c", "x"], "cwd": "/root", "exe": "/usr/bin/sh", "id": 1, "parent": null},
