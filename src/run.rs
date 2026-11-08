@@ -362,12 +362,15 @@ pub fn run(
         let mut command = Command::new("crosvm");
         command.args(crosvm_args(&base, work, output_dir, memory_mib, cpus));
         {
-            let _network = network::guest_network()?;
+            let network = network::guest_network(output_dir)?;
             let log_path = output_dir.join("crosvm.log");
             let log = File::create(&log_path).map_err(at(&log_path))?;
             let log_for_stderr = log.try_clone().map_err(at(&log_path))?;
             let mut child = image::spawn(command.stdout(log).stderr(log_for_stderr))?;
             image::wait(&command, &mut child, Some(Duration::from_secs(timeout + 300)))?;
+            for problem in network.finish() {
+                eprintln!("qim: warning: the network record may be incomplete: {problem}");
+            }
         }
         read_output(&work.join("output.raw"), output_dir)?;
     }
@@ -393,7 +396,17 @@ pub fn run(
     Ok(code as u8)
 }
 
-/// Derive events.json from audit.log; a log that cannot be converted only warns.
+/// A host-side network record of the run; None if it is missing.
+fn network_record(path: &Path) -> Result<Option<BufReader<File>>, String> {
+    match File::open(path) {
+        Ok(file) => Ok(Some(BufReader::with_capacity(1 << 20, file))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(at(path)(error)),
+    }
+}
+
+/// Derive events.json from audit.log, dns.log and packets.log; logs that
+/// cannot be converted only warn.
 fn write_events(output_dir: &Path) {
     let log = output_dir.join("audit.log");
     if !log.exists() {
@@ -402,10 +415,14 @@ fn write_events(output_dir: &Path) {
     let events = output_dir.join("events.json");
     let result = File::open(&log)
         .map_err(at(&log))
-        .and_then(|file| audit::convert(BufReader::with_capacity(1 << 20, file)))
+        .and_then(|file| {
+            let dns = network_record(&output_dir.join("dns.log"))?;
+            let packets = network_record(&output_dir.join("packets.log"))?;
+            audit::convert(BufReader::with_capacity(1 << 20, file), dns, packets)
+        })
         .and_then(|doc| fs::write(&events, audit::dump(&doc)).map_err(at(&events)));
     if let Err(error) = result {
-        eprintln!("qim: warning: cannot convert the audit log: {error}");
+        eprintln!("qim: warning: cannot write events.json: {error}");
     }
 }
 

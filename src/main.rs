@@ -3,7 +3,7 @@
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::builder::PossibleValuesParser;
@@ -44,9 +44,15 @@ enum Commands {
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true, value_name = "COMMAND")]
         command: Vec<OsString>,
     },
-    /// Convert a guest audit log into events.json (docs/events.md)
+    /// Convert a guest audit log and the host's network records into events.json (docs/events.md)
     Convert {
         audit_log: PathBuf,
+        /// The DNS record (dns.log of a run); without it, the dns list is empty
+        #[arg(long, value_name = "FILE")]
+        dns: Option<PathBuf>,
+        /// The packet record (packets.log of a run); without it, the wire list is empty
+        #[arg(long, value_name = "FILE")]
+        packets: Option<PathBuf>,
         /// Write to this file instead of standard output
         #[arg(short, long)]
         output: Option<PathBuf>,
@@ -100,9 +106,14 @@ fn execute(command: Commands) -> Result<ExitCode, String> {
         Commands::Run { image: image_name, output, timeout, memory, cpus, command } => {
             Ok(ExitCode::from(run::run(&image_name, &command, &output, timeout, memory, cpus)?))
         }
-        Commands::Convert { audit_log, output } => {
-            let log = File::open(&audit_log).map_err(|error| format!("{}: {error}", audit_log.display()))?;
-            let events = audit::dump(&audit::convert(BufReader::with_capacity(1 << 20, log))?);
+        Commands::Convert { audit_log, dns, packets, output } => {
+            let open = |path: &Path| {
+                let file = File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+                Ok::<_, String>(BufReader::with_capacity(1 << 20, file))
+            };
+            let dns = dns.as_deref().map(open).transpose()?;
+            let packets = packets.as_deref().map(open).transpose()?;
+            let events = audit::dump(&audit::convert(open(&audit_log)?, dns, packets)?);
             match output {
                 Some(path) => fs::write(&path, events).map_err(|error| format!("{}: {error}", path.display()))?,
                 None => io::stdout().write_all(events.as_bytes()).map_err(|error| format!("standard output: {error}"))?,

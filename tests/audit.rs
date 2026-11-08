@@ -4,6 +4,11 @@
 use qim::audit::{convert, dump};
 use serde_json::{Value, json};
 
+/// Convert an audit log without host-side network records.
+fn audit_only(input: &[u8]) -> Result<Value, String> {
+    convert(input, None::<&[u8]>, None)
+}
+
 const AT_FDCWD: &str = "ffffff9c";
 const W: u64 = 10000;
 
@@ -48,6 +53,7 @@ const WORKED_EXAMPLE_OUTPUT: &str = r#"{
     "syscall_events": 8,
     "unresolved_paths": 1
   },
+  "dns": [],
   "files": [
     {
       "errno": null,
@@ -162,7 +168,8 @@ const WORKED_EXAMPLE_OUTPUT: &str = r#"{
       "parent": 1
     }
   ],
-  "schema_version": 1
+  "schema_version": 1,
+  "wire": []
 }
 "#;
 
@@ -306,7 +313,7 @@ fn lines_of(events: &[Ev]) -> Vec<String> {
 }
 
 fn try_lines(lines: &[String]) -> Result<Value, String> {
-    convert(lines.join("\n").as_bytes())
+    audit_only(lines.join("\n").as_bytes())
 }
 
 fn run(events: &[Ev]) -> Value {
@@ -358,14 +365,14 @@ fn exes_of(doc: &Value) -> Vec<&str> {
 
 #[test]
 fn worked_example_output_matches_the_spec() {
-    let doc = convert(WORKED_EXAMPLE_INPUT.as_bytes()).unwrap();
+    let doc = audit_only(WORKED_EXAMPLE_INPUT.as_bytes()).unwrap();
     assert_eq!(dump(&doc), WORKED_EXAMPLE_OUTPUT);
 }
 
 #[test]
 fn worked_example_serialization_is_byte_identical_across_runs() {
-    let first = dump(&convert(WORKED_EXAMPLE_INPUT.as_bytes()).unwrap());
-    let second = dump(&convert(WORKED_EXAMPLE_INPUT.as_bytes()).unwrap());
+    let first = dump(&audit_only(WORKED_EXAMPLE_INPUT.as_bytes()).unwrap());
+    let second = dump(&audit_only(WORKED_EXAMPLE_INPUT.as_bytes()).unwrap());
     assert_eq!(first.as_bytes(), second.as_bytes());
 }
 
@@ -1045,7 +1052,7 @@ fn events_without_proctitle_are_processed_at_the_end() {
 
 #[test]
 fn malformed_line_is_rejected() {
-    assert!(convert("not an audit record\n".as_bytes()).is_err());
+    assert!(audit_only("not an audit record\n".as_bytes()).is_err());
 }
 
 // Number syntax
@@ -1075,7 +1082,7 @@ fn reads_bytes_and_replaces_invalid_utf8() {
     let mut data = ev(1, 257).exit(3).a0(AT_FDCWD).paths(&[("\"/tmp/@\"", "NORMAL")]).lines().join("\n").into_bytes();
     let at = data.iter().position(|&b| b == b'@').unwrap();
     data[at] = 0xff;
-    let doc = convert(&data[..]).unwrap();
+    let doc = audit_only(&data[..]).unwrap();
     assert_eq!(doc["files"], json!([entry("/tmp/\u{fffd}", "read")]));
 }
 
@@ -1091,7 +1098,7 @@ fn ill_formed_utf8() {
     data.push(b'\n');
     let hex_name = concat!("2F68", "E282", "41", "F08080", "EDA080", "F4908080", "42", "C3");
     data.extend(ev(2, 257).exit(4).a0(AT_FDCWD).paths(&[(hex_name, "NORMAL")]).lines().join("\n").into_bytes());
-    let doc = convert(&data[..]).unwrap();
+    let doc = audit_only(&data[..]).unwrap();
     let replaced = format!("/q\u{fffd}A{}B\u{fffd}", "\u{fffd}".repeat(10));
     assert_eq!(
         doc["files"],
@@ -1100,4 +1107,103 @@ fn ill_formed_utf8() {
             entry(&replaced, "read"),
         ])
     );
+}
+
+// Host-side network records
+
+fn with_records(dns: &str, packets: &str) -> Result<Value, String> {
+    convert(WORKED_EXAMPLE_INPUT.as_bytes(), Some(dns.as_bytes()), Some(packets.as_bytes()))
+}
+
+#[test]
+fn dns_entries_are_distinct_with_sorted_answers() {
+    let dns = r#"{"name": "b.example", "type": "A", "rcode": "NOERROR", "answers": ["192.0.2.2", "192.0.2.1", "192.0.2.2"]}
+{"name": "a.example", "type": "AAAA", "rcode": "NOERROR", "answers": []}
+{"name": "a.example", "type": "A", "rcode": null, "answers": []}
+{"name": "a.example", "type": "A", "rcode": "NOERROR", "answers": ["192.0.2.9"]}
+{"name": "b.example", "type": "A", "rcode": "NOERROR", "answers": ["192.0.2.1", "192.0.2.2"]}
+"#;
+    // By (name, type, canonical JSON): for a.example A, '"' sorts before ']'
+    // in {"answers":["... versus {"answers":[]...
+    assert_eq!(
+        with_records(dns, "").unwrap()["dns"],
+        json!([
+            {"name": "a.example", "type": "A", "rcode": "NOERROR", "answers": ["192.0.2.9"]},
+            {"name": "a.example", "type": "A", "rcode": null, "answers": []},
+            {"name": "a.example", "type": "AAAA", "rcode": "NOERROR", "answers": []},
+            {"name": "b.example", "type": "A", "rcode": "NOERROR", "answers": ["192.0.2.1", "192.0.2.2"]},
+        ])
+    );
+}
+
+#[test]
+fn wire_entries_are_distinct_and_ordered_by_destination() {
+    let packets = r#"{"protocol": "udp", "family": "inet", "address": "192.0.2.1", "port": 53}
+{"protocol": "tcp", "family": "inet", "address": "192.0.2.1", "port": 443}
+{"protocol": "icmp", "family": "inet", "address": "192.0.2.1", "port": null}
+{"protocol": "tcp", "family": "inet6", "address": "2001:db8::1", "port": 443}
+{"protocol": "udp", "family": "inet", "address": "192.0.2.1", "port": 53}
+{"protocol": "tcp", "family": "inet", "address": "10.0.0.1", "port": 80}
+{"protocol": "udp", "family": "inet", "address": "192.0.2.1", "port": 443}"#;
+    assert_eq!(
+        with_records("", packets).unwrap()["wire"],
+        json!([
+            {"protocol": "tcp", "family": "inet", "address": "10.0.0.1", "port": 80},
+            {"protocol": "icmp", "family": "inet", "address": "192.0.2.1", "port": null},
+            {"protocol": "udp", "family": "inet", "address": "192.0.2.1", "port": 53},
+            {"protocol": "tcp", "family": "inet", "address": "192.0.2.1", "port": 443},
+            {"protocol": "udp", "family": "inet", "address": "192.0.2.1", "port": 443},
+            {"protocol": "tcp", "family": "inet6", "address": "2001:db8::1", "port": 443},
+        ])
+    );
+}
+
+#[test]
+fn missing_or_empty_records_are_empty_lists() {
+    let missing = audit_only(WORKED_EXAMPLE_INPUT.as_bytes()).unwrap();
+    let empty = with_records("", "").unwrap();
+    for doc in [missing, empty] {
+        assert_eq!(doc["dns"], json!([]));
+        assert_eq!(doc["wire"], json!([]));
+    }
+}
+
+#[test]
+fn records_with_other_keys_or_value_types_are_rejected() {
+    let valid_dns = r#"{"name": "a", "type": "A", "rcode": null, "answers": []}"#;
+    let valid_packet = r#"{"protocol": "udp", "family": "inet", "address": "192.0.2.1", "port": 53}"#;
+    assert!(with_records(valid_dns, valid_packet).is_ok());
+    let bad_dns = [
+        "not json",
+        "[]",
+        "\"a\"",
+        "",
+        r#"{"name": "a", "type": "A", "rcode": null}"#,
+        r#"{"name": "a", "type": "A", "rcode": null, "answers": [], "extra": 1}"#,
+        r#"{"name": null, "type": "A", "rcode": null, "answers": []}"#,
+        r#"{"name": "a", "type": 1, "rcode": null, "answers": []}"#,
+        r#"{"name": "a", "type": "A", "rcode": 0, "answers": []}"#,
+        r#"{"name": "a", "type": "A", "rcode": null, "answers": "192.0.2.1"}"#,
+        r#"{"name": "a", "type": "A", "rcode": null, "answers": [1]}"#,
+    ];
+    for bad in bad_dns {
+        assert!(with_records(&format!("{valid_dns}\n{bad}\n{valid_dns}\n"), "").is_err(), "{bad}");
+    }
+    let bad_packets = [
+        "{}",
+        r#"{"protocol": "udp", "family": "inet", "address": "192.0.2.1"}"#,
+        r#"{"protocol": "udp", "family": "inet", "address": "192.0.2.1", "port": 53, "x": null}"#,
+        r#"{"protocol": 17, "family": "inet", "address": "192.0.2.1", "port": 53}"#,
+        r#"{"protocol": "udp", "family": null, "address": "192.0.2.1", "port": 53}"#,
+        r#"{"protocol": "udp", "family": "inet", "address": [], "port": 53}"#,
+        r#"{"protocol": "udp", "family": "inet", "address": "192.0.2.1", "port": "53"}"#,
+        r#"{"protocol": "udp", "family": "inet", "address": "192.0.2.1", "port": 53.5}"#,
+    ];
+    for bad in bad_packets {
+        assert!(with_records("", &format!("{valid_packet}\n{bad}\n")).is_err(), "{bad}");
+    }
+    // Lines must be UTF-8.
+    let mut not_utf8 = valid_packet.as_bytes().to_vec();
+    not_utf8[42] = 0xff;
+    assert!(convert(WORKED_EXAMPLE_INPUT.as_bytes(), None, Some(&not_utf8[..])).is_err());
 }

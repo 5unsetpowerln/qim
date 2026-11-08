@@ -1,4 +1,5 @@
-//! Conversion of the guest audit log into events.json (docs/events.md).
+//! Conversion of the guest audit log and the host-side network records into
+//! events.json (docs/events.md).
 
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, BinaryHeap, HashMap};
@@ -288,7 +289,7 @@ fn argv(fields: &HashMap<&str, &str>) -> Result<Vec<Value>, String> {
 }
 
 /// RFC 5952 text, with IPv4-mapped addresses as ::ffff:a.b.c.d (Python's ipaddress).
-fn ipv6_text(b: &[u8]) -> String {
+pub(crate) fn ipv6_text(b: &[u8]) -> String {
     let h: Vec<u16> = (0..8).map(|i| u16::from_be_bytes([b[2 * i], b[2 * i + 1]])).collect();
     if h[..5].iter().all(|&x| x == 0) && h[5] == 0xffff {
         return format!("::ffff:{}.{}.{}.{}", b[12], b[13], b[14], b[15]);
@@ -795,19 +796,112 @@ fn canonical(entry: &Value) -> String {
     serde_json::to_string(entry).expect("a JSON value always serializes")
 }
 
-/// Convert an audit log (one record per line) into the events.json document.
-/// Lines are decoded as UTF-8 with replacement characters.
-pub fn convert<R: BufRead>(mut input: R) -> Result<Value, String> {
+/// The objects of a host-side record (dns.log or packets.log), one JSON object
+/// per line; `valid` checks that an object has exactly the record's keys and
+/// value types.
+fn host_records<R: BufRead>(
+    input: R,
+    record: &str,
+    valid: fn(&Map<String, Value>) -> bool,
+) -> Result<Vec<Map<String, Value>>, String> {
+    let mut objects = Vec::new();
+    for (index, line) in input.lines().enumerate() {
+        let line = line.map_err(|e| format!("{record} line {}: {e}", index + 1))?;
+        match serde_json::from_str(&line) {
+            Ok(Value::Object(object)) if valid(&object) => objects.push(object),
+            _ => {
+                let shown = line.chars().take(200).collect::<String>();
+                return Err(format!("{record} line {}: not a valid record: {shown:?}", index + 1));
+            }
+        }
+    }
+    Ok(objects)
+}
+
+fn is_string_or_null(value: &Value) -> bool {
+    value.is_string() || value.is_null()
+}
+
+fn is_integer(value: &Value) -> bool {
+    value.is_i64() || value.is_u64()
+}
+
+fn is_dns_record(object: &Map<String, Value>) -> bool {
+    object.len() == 4
+        && object.get("name").is_some_and(Value::is_string)
+        && object.get("type").is_some_and(Value::is_string)
+        && object.get("rcode").is_some_and(is_string_or_null)
+        && object.get("answers").and_then(Value::as_array).is_some_and(|answers| answers.iter().all(Value::is_string))
+}
+
+fn is_packet_record(object: &Map<String, Value>) -> bool {
+    object.len() == 4
+        && object.get("protocol").is_some_and(Value::is_string)
+        && object.get("family").is_some_and(Value::is_string)
+        && object.get("address").is_some_and(Value::is_string)
+        && object.get("port").is_some_and(|port| port.is_null() || is_integer(port))
+}
+
+fn text(value: &Value) -> String {
+    value.as_str().expect("checked to be a string").to_string()
+}
+
+/// The distinct entries, ordered by their sort keys; the canonical JSON that
+/// ends every key makes equal keys mean equal entries.
+fn distinct<K: Ord>(mut entries: Vec<(K, Value)>) -> Vec<Value> {
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries.dedup_by(|a, b| a.0 == b.0);
+    entries.into_iter().map(|(_, entry)| entry).collect()
+}
+
+/// `dns`: the distinct dns.log objects with sorted, deduplicated answers.
+fn dns_entries(objects: Vec<Map<String, Value>>) -> Vec<Value> {
+    let entries = objects
+        .into_iter()
+        .map(|mut object| {
+            let answers: BTreeSet<String> = object["answers"].as_array().expect("checked").iter().map(text).collect();
+            object.insert("answers".into(), json!(answers));
+            let entry = Value::Object(object);
+            ((text(&entry["name"]), text(&entry["type"]), canonical(&entry)), entry)
+        })
+        .collect();
+    distinct(entries)
+}
+
+/// `wire`: the distinct packets.log objects.
+fn wire_entries(objects: Vec<Map<String, Value>>) -> Vec<Value> {
+    let entries = objects
+        .into_iter()
+        .map(|object| {
+            let entry = Value::Object(object);
+            let port = &entry["port"];
+            let port = port.as_i64().map(i128::from).or(port.as_u64().map(i128::from)).unwrap_or(-1);
+            ((text(&entry["family"]), text(&entry["address"]), port, text(&entry["protocol"]), canonical(&entry)), entry)
+        })
+        .collect();
+    distinct(entries)
+}
+
+/// Convert an audit log (one record per line) and the host's DNS and packet
+/// records into the events.json document. A record that is None is missing
+/// and yields an empty list. Audit log lines are decoded as UTF-8 with
+/// replacement characters; the host records must be UTF-8.
+pub fn convert<A: BufRead, R: BufRead>(mut audit: A, dns: Option<R>, packets: Option<R>) -> Result<Value, String> {
     let mut converter = Converter::new();
     let mut line = Vec::new();
     loop {
         line.clear();
-        if input.read_until(b'\n', &mut line).map_err(|e| e.to_string())? == 0 {
+        if audit.read_until(b'\n', &mut line).map_err(|e| e.to_string())? == 0 {
             break;
         }
         converter.feed(&String::from_utf8_lossy(&line))?;
     }
-    converter.finish()
+    let mut doc = converter.finish()?;
+    let dns = dns.map(|dns| host_records(dns, "DNS record", is_dns_record)).transpose()?;
+    let packets = packets.map(|packets| host_records(packets, "packet record", is_packet_record)).transpose()?;
+    doc["dns"] = json!(dns_entries(dns.unwrap_or_default()));
+    doc["wire"] = json!(wire_entries(packets.unwrap_or_default()));
+    Ok(doc)
 }
 
 /// Serialize the document exactly as docs/events.md specifies:
