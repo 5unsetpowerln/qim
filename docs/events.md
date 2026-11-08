@@ -33,9 +33,11 @@ is one record:
   counted, even when they share a serial with a syscall event.
 - Events are processed in ascending numeric order of their serial. The serial
   is assigned when the kernel emits the event (at syscall exit), so records
-  can arrive out of serial order. An input in which a record with serial `s`
-  appears after a record with serial `s + 10000` or larger (the reorder
-  window) is rejected, as are malformed lines.
+  can arrive out of serial order. An input in which a record of one of the
+  syscall event types with serial `s` appears after such a record with
+  serial `s + 10000` or larger (the reorder window) is rejected, as are
+  malformed lines. Records of other types do not take part in this check
+  (auditd numbers its own `DAEMON_*` records independently).
 - A value is either a double-quoted string (taken literally without the
   quotes), the literal `(null)`, or an unquoted token. In `EXECVE`, `PATH`
   `name`, `CWD` `cwd` and `SYSCALL` `exe`, an unquoted token that is not
@@ -67,7 +69,13 @@ event seen from that pid since its state was last reset (`origin[pid]`).
 
 - The first event from a pid without state creates an empty state with that
   event's `ppid` and serial as its origin.
-- After a successful exec by `pid`, `current[pid]` is the new image.
+- A successful exec by `pid` whose `ppid` differs from the ppid of
+  `origin[pid]` comes from a new process that reuses the pid of an earlier
+  one, so the state of `pid` is first reset as if `ppid` had just created it
+  at this serial (`current[pid] = current[ppid]`, its fd table becomes a copy
+  of `ppid`'s, its origin is `(ppid, serial)`). Then `current[pid]` is the new
+  image. (A process that execs after being reparented to pid 1 is also
+  reset; such an image gets the parent `current[1]`, normally none.)
 - A successful `clone` (56), `clone3` (435), `fork` (57) or `vfork` (58) at
   serial `S` in pid `p` whose `exit` is a positive child pid `c`:
   - If `c` already has state whose origin has `ppid == p` and a serial `o`
@@ -143,8 +151,9 @@ File descriptor arguments (`a0` of `close`, `dup*`, `fcntl` and the `*at`
 directory arguments) are the low 32 bits of the register as a signed integer.
 
 Known limitations, accepted in version 1: `O_CLOEXEC` is not applied at exec,
-`CLONE_FILES` sharing is treated as a copy, and fds received over
-`SCM_RIGHTS` are unknown.
+`CLONE_FILES` sharing is treated as a copy, fds received over `SCM_RIGHTS`
+are unknown, and for a child whose events were logged before its creation,
+fds it closed before that point are filled in again from the parent.
 
 ### Operations
 
