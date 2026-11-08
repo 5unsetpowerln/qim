@@ -69,13 +69,15 @@ event seen from that pid since its state was last reset (`origin[pid]`).
 
 - The first event from a pid without state creates an empty state with that
   event's `ppid` and serial as its origin.
-- A successful exec by `pid` whose `ppid` differs from the ppid of
-  `origin[pid]` comes from a new process that reuses the pid of an earlier
-  one, so the state of `pid` is first reset as if `ppid` had just created it
-  at this serial (`current[pid] = current[ppid]`, its fd table becomes a copy
-  of `ppid`'s, its origin is `(ppid, serial)`). Then `current[pid]` is the new
-  image. (A process that execs after being reparented to pid 1 is also
-  reset; such an image gets the parent `current[1]`, normally none.)
+- A successful exec at serial `S` by `pid` whose `ppid` differs from the ppid
+  of `origin[pid]` and whose origin serial `o` is old (`o <= S - 10000`)
+  comes from a new process that reuses the pid of an earlier one, so the
+  state of `pid` is first reset as if `ppid` had just created it at this
+  serial (`current[pid] = current[ppid]`, its fd table becomes a copy of
+  `ppid`'s, its origin is `(ppid, S)`). Then `current[pid]` is the new image.
+  A recent origin with another ppid is a process that was reparented (to
+  pid 1, typically after a double fork) and keeps its state. A pid reused
+  within the window is not detected.
 - A successful `clone` (56), `clone3` (435), `fork` (57) or `vfork` (58) at
   serial `S` in pid `p` whose `exit` is a positive child pid `c`:
   - If `c` already has state whose origin has `ppid == p` and a serial `o`
