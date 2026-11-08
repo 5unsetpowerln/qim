@@ -1,0 +1,11 @@
+#!/bin/sh
+# Run qim inside the development container with the devices and privileges it
+# needs (KVM, tap devices, bind mounts). Images and outputs go to build/qim.
+set -eu
+repo=$(cd "$(dirname "$0")/.." && pwd)
+exec "$repo/dev/podman" run --rm \
+  --device /dev/kvm --device /dev/net/tun --group-add keep-groups \
+  --cap-add SYS_ADMIN --cap-add NET_ADMIN --sysctl net.ipv4.ip_forward=1 \
+  -v "$repo:/src:ro" -v "$repo/build:/work" \
+  -e QIM_HOME=/work/qim -e PYTHONPATH=/src -e PYTHONDONTWRITEBYTECODE=1 -w /work \
+  qim-dev python3 -m qim "$@"
