@@ -27,16 +27,17 @@ def entry(name, kind=tarfile.REGTYPE, **attributes):
 
 
 class InputTarTest(unittest.TestCase):
-    def test_contains_init_config_and_nul_separated_argv(self):
+    def test_contains_the_guest_programs_config_and_nul_separated_argv(self):
         data = run.input_tar(["sh", "-c", "echo 'a b'"], "qim", 60)
         with tarfile.open(fileobj=io.BytesIO(data)) as archive:
             files = {member.name: archive.extractfile(member).read() for member in archive}
             modes = {member.name: member.mode for member in archive.getmembers()}
-        self.assertEqual(set(files), {"init", "config", "argv"})
+        self.assertEqual(set(files), {"init", "audit-reader", "config", "argv"})
         self.assertEqual(files["argv"], b"sh\0-c\0echo 'a b'\0")
         self.assertIn(b"QIM_USER=qim\n", files["config"])
         self.assertIn(b"QIM_TIMEOUT=60\n", files["config"])
         self.assertEqual(modes["init"], 0o755)
+        self.assertEqual(modes["audit-reader"], 0o755)
 
     def test_root_user_is_an_empty_value(self):
         data = run.input_tar(["true"], None, 60)
@@ -85,6 +86,30 @@ class ReadOutputTest(unittest.TestCase):
         self.assertEqual(list((output / "meta").iterdir()), [])
         with tarfile.open(output / "upper.tar") as upper:
             self.assertEqual(upper.getmembers(), [])
+
+
+class RecordingProblemsTest(unittest.TestCase):
+    STATUS = "enabled 1\nfailure 1\npid {pid}\nrate_limit 0\nbacklog_limit 0\nlost {lost}\nbacklog 0\n"
+
+    def problems(self, pid="117", lost="0", reader_exit="0"):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        meta = Path(directory.name)
+        (meta / "audit_status").write_text(self.STATUS.format(pid=pid, lost=lost))
+        (meta / "audit_reader_exit").write_text(reader_exit + "\n")
+        return run.recording_problems(meta)
+
+    def test_complete_record(self):
+        self.assertEqual(self.problems(), [])
+
+    def test_each_reason_is_reported(self):
+        self.assertEqual(self.problems(lost="3"), ["the kernel lost 3 records"])
+        self.assertEqual(self.problems(pid="0"), ["the reader was no longer registered when the command ended"])
+        self.assertEqual(self.problems(reader_exit="2"), ["the reader exited with status 2"])
+
+    def test_missing_status_is_a_problem(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(len(run.recording_problems(Path(directory))), 1)
 
 
 if __name__ == "__main__":
