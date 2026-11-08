@@ -135,7 +135,10 @@ pub fn default_date(today: Date) -> Date {
 ///
 /// It deliberately has no NoExtract lines: container images commonly exclude
 /// etc/pacman.conf, the mirrorlist, man pages and locales, and those
-/// exclusions must not leak into the guest.
+/// exclusions must not leak into the guest. The archive is a single, slow
+/// server that sometimes stalls, and there is no other server to fall back
+/// to, so pacman's low-speed abort is disabled; the run's timeout bounds the
+/// time instead.
 pub fn pacman_conf(date: Date, cache_dir: Option<&str>) -> String {
     let server = ARCHIVE_SERVER.replace("{date}", &format!("{:04}/{:02}/{:02}", date.year, date.month, date.day));
     let mut lines: Vec<String> = [
@@ -144,6 +147,7 @@ pub fn pacman_conf(date: Date, cache_dir: Option<&str>) -> String {
         "SigLevel = Required DatabaseOptional",
         "LocalFileSigLevel = Optional",
         "ParallelDownloads = 5",
+        "DisableDownloadTimeout",
     ]
     .map(String::from)
     .into();
@@ -950,6 +954,11 @@ mod tests {
         let server = "Server = https://archive.archlinux.org/repos/2026/11/08/$repo/os/$arch";
         assert!(conf.contains(&format!("[core]\n{server}\n")));
         assert!(conf.contains(&format!("[extra]\n{server}\n")));
+    }
+
+    #[test]
+    fn stalls_of_the_archive_do_not_abort_downloads() {
+        assert!(pacman_conf(date(2026, 11, 8), None).contains("[options]\nArchitecture = auto\nSigLevel = Required DatabaseOptional\nLocalFileSigLevel = Optional\nParallelDownloads = 5\nDisableDownloadTimeout\n"));
     }
 
     #[test]
