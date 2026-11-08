@@ -81,6 +81,30 @@ def chroot_mounts(root: Path):
             subprocess.run(["umount", "-R", "-l", str(path)], check=False)
 
 
+@contextlib.contextmanager
+def setup_mounts(root: Path):
+    """A scratch /tmp and the host's resolver for the profile's setup script."""
+    mounted = []
+    try:
+        run("mount", "-t", "tmpfs", "tmp", root / "tmp")
+        mounted.append(root / "tmp")
+        run("mount", "--bind", "/etc/resolv.conf", root / "etc/resolv.conf")
+        mounted.append(root / "etc/resolv.conf")
+        yield
+    finally:
+        for path in reversed(mounted):
+            subprocess.run(["umount", str(path)], check=False)
+
+
+def run_setup(root: Path, profile: profiles.Profile) -> None:
+    home = f"/home/{profile.user}" if profile.user else "/root"
+    user = profile.user or "root"
+    with setup_mounts(root):
+        run("chroot", f"--userspec={user}:{user}", root,
+            "env", "-i", f"HOME={home}", f"USER={user}", "PATH=/usr/local/bin:/usr/bin", "LANG=C.UTF-8",
+            "bash", "-c", f"cd ~ && {profile.setup}")
+
+
 def configure(root: Path, profile: profiles.Profile) -> None:
     (root / "etc/hostname").write_text("qim-guest\n")
     boot = root / "usr/lib/qim/boot"
@@ -167,6 +191,8 @@ def build(profile_name: str, date: datetime.date, name: str | None = None) -> Pa
         for leftover in (root / "etc/pacman.d/gnupg").glob("S.*"):
             leftover.unlink()
         configure(root, profile)
+        if profile.setup:
+            run_setup(root, profile)
 
     kernels = sorted((root / "usr/lib/modules").glob("*/vmlinuz"))
     if len(kernels) != 1:
