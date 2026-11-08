@@ -58,6 +58,10 @@ mount -t proc proc "$root/proc"
 # such as kernel.io_uring_disabled stay as set above even for root.
 mount --bind "$root/proc/sys" "$root/proc/sys"
 mount -o remount,bind,ro "$root/proc/sys"
+# Root may write /proc/sysrq-trigger whatever kernel.sysrq says, and could
+# crash the guest with it; on a read-only mount, opening it to write fails.
+mount --bind "$root/proc/sysrq-trigger" "$root/proc/sysrq-trigger" &&
+  mount -o remount,bind,ro "$root/proc/sysrq-trigger" || die "cannot protect /proc/sysrq-trigger"
 mount -t sysfs -o ro sys "$root/sys"
 # A minimal /dev without the disks.
 mount -t tmpfs -o mode=0755,nosuid dev "$root/dev"
