@@ -1,0 +1,1 @@
+"""Quarantined Installation Monitor."""
