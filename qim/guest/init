@@ -16,8 +16,21 @@ die() {
   poweroff -f
 }
 
-# Opened before the root changes: the output disk and, below, the upper layer.
+# Opened before the root changes: the output disk, the audit channel to the
+# host (a virtio console) and, below, the upper layer.
 exec 9>/dev/vdd || die "cannot open the output disk"
+exec 7>/dev/hvc0 || die "cannot open the audit channel"
+
+# The reader starts from the original root, so nothing in the overlay root
+# that the command sees refers to it or to the channel.
+python3 "$in/audit-reader" 7 9>&- 2>/dev/console &
+reader=$!
+exec 7>&-
+for _ in $(seq 50); do
+  [ "$(auditctl -s | awk '$1 == "pid" {print $2}')" = "$reader" ] && break
+  sleep 0.1
+done
+[ "$(auditctl -s | awk '$1 == "pid" {print $2}')" = "$reader" ] || die "the audit reader did not register"
 modprobe overlay || die "cannot load overlay"
 modprobe virtio_net || die "cannot load virtio_net"
 
@@ -52,6 +65,18 @@ ip addr add "$QIM_ADDRESS" dev eth0
 ip link set eth0 up
 ip route add default via "$QIM_GATEWAY"
 
+auditctl -D >/dev/null
+for rule in \
+  "-S execve,execveat -k exec" \
+  "-S open,openat,openat2,creat -k open" \
+  "-S unlink,unlinkat,rename,renameat,renameat2,mkdir,mkdirat,rmdir,link,linkat,symlink,symlinkat -k fsmod" \
+  "-S chdir,fchdir,dup,dup2,dup3,close,close_range,fcntl -k fd" \
+  "-S clone,clone3,fork,vfork -k proc" \
+  "-S connect,sendto,sendmsg,sendmmsg -k net"; do
+  # shellcheck disable=SC2086
+  auditctl -a always,exit -F arch=b64 $rule >/dev/null || die "cannot add audit rule: $rule"
+done
+
 mkdir -p /run/qim/meta
 if [ -n "$QIM_USER" ]; then
   home=$(getent passwd "$QIM_USER" | cut -d: -f6)
@@ -67,10 +92,26 @@ timeout --kill-after=10 "$QIM_TIMEOUT" "${runner[@]}" env LANG=C.UTF-8 TERM=dumb
 echo "$?" >/run/qim/meta/exit_code
 cd /
 
-# Stop everything the command left behind so that the upper layer is quiet.
-kill -9 -1 2>/dev/null
-sleep 1
+# Stop everything the command left behind so that the upper layer is quiet,
+# except the audit reader.
+for _ in 1 2 3; do
+  for entry in /proc/[0-9]*; do
+    pid=${entry#/proc/}
+    [ "$pid" = 1 ] || [ "$pid" = "$reader" ] || kill -9 "$pid" 2>/dev/null
+  done
+  sleep 0.5
+done
 sync
+
+# Let the reader drain the kernel queue before it stops.
+for _ in $(seq 6000); do
+  [ "$(auditctl -s | awk '$1 == "backlog" {print $2}')" = 0 ] && break
+  sleep 0.1
+done
+auditctl -s >/run/qim/meta/audit_status
+kill -TERM "$reader"
+wait "$reader"
+echo "$?" >/run/qim/meta/audit_reader_exit
 tar --create --file=- --numeric-owner --xattrs \
   --xattrs-include='trusted.overlay.*' --xattrs-include='security.capability' \
   -C /run/qim meta -C /proc/self/fd/8 --transform='s,^\.,upper,' . >&9 || log "cannot write the output"
