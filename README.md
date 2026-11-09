@@ -43,10 +43,13 @@ run above writes to `build/qim/runs/<UTC time>` (qim prints the directory as
 
 - `qim run [--profile default|aur] [--output DIR] [--timeout S] [--memory MIB] [--cpus N] -- COMMAND...`
   boots the profile's base image read-only with a writable overlay, runs the
-  command (stdin is /dev/null) and writes the outputs to DIR, by default
-  `runs/<UTC time>` in qim's directory (`$QIM_HOME`, or `~/.cache/qim`). Its
-  exit code is the command's. When the host's pacman state has no image yet,
-  it builds one first.
+  command (stdin is /dev/null), shows its output while it runs and its exit
+  status at the end, and writes the outputs to DIR, by default
+  `runs/<UTC time>` in qim's directory (`$QIM_HOME`, or `~/.cache/qim`). The
+  output shown leaves out escape sequences and control characters, which the
+  guest could use to control the terminal; meta/command.log keeps it as it
+  was. The exit code is the command's. When the host's pacman state has no
+  image yet, qim builds one first.
 - `qim image build [--profile default|aur]` builds that image ahead of time
   and prints its directory.
 
