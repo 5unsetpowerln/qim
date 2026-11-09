@@ -30,8 +30,7 @@ nftables. On other hosts, use the development container below.
 
     dev/podman build --tag qim-dev -f dev/Containerfile dev   # once
     dev/cargo test --release                                  # unit tests
-    dev/qim image build --profile aur --date 2026-11-08       # base image
-    dev/qim run --image aur-20261108 --output /work/out/tty-clock \
+    dev/qim run --profile aur --output /work/out/tty-clock \
         -- paru -S --noconfirm --skipreview tty-clock
 
 `dev/podman` keeps all container storage in `build/containers`, `dev/cargo`
@@ -42,15 +41,25 @@ the container `/work` is `build/`, so the run above writes to
 
 ## Commands
 
-- `qim image build [--profile default|aur] [--date YYYY-MM-DD] [--name NAME]`
-  builds a base image from the Arch Linux Archive snapshot of the date
-  (default: yesterday). The packages, and the repository packages the guest
-  installs later, are fixed by the date. The `aur` profile adds base-devel,
-  git, sudo (for pacman only) and paru, and runs commands as the user `qim`.
-- `qim run --image NAME --output DIR [--timeout S] [--memory MIB] [--cpus N] -- COMMAND...`
-  boots the image read-only with a writable overlay, runs the command
-  (stdin is /dev/null) and writes the outputs to DIR. Its exit code is the
-  command's.
+- `qim run [--profile default|aur] --output DIR [--timeout S] [--memory MIB] [--cpus N] -- COMMAND...`
+  boots the profile's base image read-only with a writable overlay, runs the
+  command (stdin is /dev/null) and writes the outputs to DIR. Its exit code
+  is the command's. When the host's pacman state has no image yet, it builds
+  one first.
+- `qim image build [--profile default|aur]` builds that image ahead of time
+  and prints its directory.
+
+A base image follows the host's pacman state: it is built with the host's
+pacman configuration (as `pacman-conf` prints it, without the options that
+locate the host's own files) from a copy of the host's sync databases, which
+is never refreshed, and it carries the host's makepkg.conf and
+makepkg.conf.d. So the guest has, and installs, the package versions the
+host's pacman would install now, much like paru's `--chroot` but without
+moving ahead to the mirrors' newest packages. Every image contains base,
+linux, audit, iproute2 and zstd, which qim uses in the guest; the `aur`
+profile adds base-devel, git, sudo (for pacman only) and paru, and runs
+commands as the user `qim`. Images are named after a digest of the host
+state, so updating the host leads to a new image.
 - `qim convert AUDIT_LOG [--dns FILE] [--packets FILE] [-o OUTPUT]`
   derives events.json again from a run's records; the result is byte for
   byte the same.
@@ -64,10 +73,13 @@ the container `/work` is `build/`, so the run above writes to
 | `artifacts/`, `artifacts.json` | the files selected by the profile (no setuid bits, ownership or xattrs) |
 | `audit.log`, `dns.log`, `packets.log` | the raw records events.json is derived from |
 | `upper.tar` | the overlay's upper layer as the guest returned it |
-| `meta/` | exit code, command output, audit diagnostics (`samples`), kernel log |
+| `meta/` | exit code, command output, audit diagnostics (`samples`), kernel log, the guest's packages at the end (`packages`) |
 
 qim warns when the audit record may be incomplete (records lost, the reader
-stopped early or its socket overflowed).
+stopped early or its socket overflowed), and when the guest ended with a
+repository package in another version than the host has installed: then the
+host has updates it has not applied, and what was built may need library
+versions the host does not have.
 
 ## Recording and isolation
 
