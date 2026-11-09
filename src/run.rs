@@ -322,6 +322,28 @@ fn crosvm_args(base: &Path, work: &Path, output_dir: &Path, memory_mib: u64, cpu
     ]
 }
 
+/// Where a run writes its outputs when no directory is given: runs/<UTC time> in qim's directory.
+pub fn default_output_dir() -> Result<PathBuf, String> {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("the clock is set after 1970");
+    Ok(image::home()?.join("runs").join(utc_timestamp(now.as_secs() as i64)))
+}
+
+/// `seconds` since the epoch as YYYYMMDDTHHMMSSZ.
+pub fn utc_timestamp(seconds: i64) -> String {
+    // SAFETY: a zeroed tm is a valid value, and gmtime_r writes only into it.
+    let mut parts: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe { libc::gmtime_r(&(seconds as _), &mut parts) };
+    format!(
+        "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
+        parts.tm_year + 1900,
+        parts.tm_mon + 1,
+        parts.tm_mday,
+        parts.tm_hour,
+        parts.tm_min,
+        parts.tm_sec
+    )
+}
+
 pub fn run(
     base: &Path,
     argv: &[OsString],
@@ -896,5 +918,12 @@ mod tests {
         let host_installed = "glibc 2.41-3\nzlib 1:1.3.1-2\ntty-clock 2.3-1\n";
         let host_sync = "core glibc 2.42-1 [installed: 2.41-3]\ncore zlib 1:1.3.1-2 [installed]\ncore curl 8.10-1\n";
         assert_eq!(version_mismatches(guest, host_installed, host_sync), ["glibc is 2.42-1 in the guest but 2.41-3 on the host"]);
+    }
+
+    #[test]
+    fn timestamps_are_utc_and_sortable() {
+        assert_eq!(utc_timestamp(0), "19700101T000000Z");
+        // 20766 days after the epoch is 2026-11-09.
+        assert_eq!(utc_timestamp(20766 * 86400 + 3661), "20261109T010101Z");
     }
 }

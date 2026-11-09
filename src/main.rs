@@ -30,9 +30,9 @@ enum Commands {
         /// The guest's profile; its image for the host's current pacman state is built first if needed
         #[arg(long, default_value = "default", value_parser = PossibleValuesParser::new(profiles::names()))]
         profile: String,
-        /// Output directory (must not exist)
+        /// Output directory, which must not exist (default: runs/<UTC time> in qim's directory, $QIM_HOME or ~/.cache/qim)
         #[arg(long)]
-        output: PathBuf,
+        output: Option<PathBuf>,
         /// Seconds before the command is killed
         #[arg(long, default_value_t = 3600)]
         timeout: u64,
@@ -97,7 +97,12 @@ fn execute(command: Commands) -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
         Commands::Run { profile, output, timeout, memory, cpus, command } => {
+            let output = match output {
+                Some(output) => output,
+                None => run::default_output_dir()?,
+            };
             let base = image::ensure(&profile)?;
+            eprintln!("qim: writing the outputs to {}", output.display());
             Ok(ExitCode::from(run::run(&base, &command, &output, timeout, memory, cpus)?))
         }
         Commands::Convert { audit_log, dns, packets, output } => {
