@@ -10,3 +10,4 @@ pub mod image;
 pub mod network;
 pub mod profiles;
 pub mod run;
+pub mod terminal;

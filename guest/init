@@ -18,8 +18,11 @@ die() {
   poweroff -f
 }
 
-# Opened before the root changes: the output disk and, below, the upper layer.
+# Opened before the root changes: the output disk, the stream that carries
+# the command's output to the host while it runs (a virtio console qim shows),
+# and, below, the upper layer.
 exec 9>/dev/vdd || die "cannot open the output disk"
+exec 6>/dev/hvc0 || die "cannot open the output stream"
 
 # The reader writes diagnostic samples here and, as its last line, its final
 # status. It lives in the original root, so the init keeps a read fd to it
@@ -41,7 +44,7 @@ exec 7</run/qim/samples || die "cannot open the samples file"
 chown 999:999 /dev/vde || die "cannot hand the audit disk to the reader"
 reader_caps=+audit_control,+audit_read,+net_admin
 setpriv --reuid=999 --regid=999 --clear-groups --inh-caps="-all,$reader_caps" --ambient-caps="$reader_caps" \
-  "$in/audit-reader" /dev/vde /run/qim/samples 9>&- 7<&- 2>/dev/console &
+  "$in/audit-reader" /dev/vde /run/qim/samples 9>&- 7<&- 6>&- 2>/dev/console &
 reader=$!
 for _ in $(seq 50); do
   [ "$(auditctl -s | awk '$1 == "pid" {print $2}')" = "$reader" ] && break
@@ -124,6 +127,18 @@ ip route add default via "$QIM_GATEWAY"
 drop=-mknod,-sys_admin,-sys_module,-sys_rawio,-sys_ptrace,-sys_boot,-audit_control,-audit_read,-kill,-net_admin,-net_raw,-mac_admin,-mac_override,-bpf,-perfmon,-syslog,-sys_time
 
 mkdir -p /run/qim/meta
+# The command's output goes through tee to meta/command.log and the stream.
+# tee starts now, before any audit rule, so that its exec is not recorded, and
+# the init waits until the process substitution runs tee before going on.
+exec 5> >(exec tee --output-error=warn /run/qim/meta/command.log >&6 7<&- 8<&- 9>&-)
+stream=$!
+comm=
+for _ in $(seq 50); do
+  read -r comm <"/proc/$stream/comm" && [ "$comm" = tee ] && break
+  sleep 0.1
+done
+[ "$comm" = tee ] || die "the output stream did not start"
+exec 6>&-
 if [ -n "$QIM_USER" ]; then
   home=$(getent passwd "$QIM_USER" | cut -d: -f6)
   runner=(setpriv --reuid="$QIM_USER" --regid="$QIM_USER" --init-groups --reset-env --bounding-set="$drop")
@@ -171,14 +186,16 @@ log "running: ${argv[*]}"
 (
   # The init's own descriptors (fds opened by `exec N>` are inherited) must
   # not reach the command: 9 writes the output disk, 8 opens the upper layer
-  # beside the overlay, 7 reads the reader's samples.
-  exec 7<&- 8<&- 9>&-
+  # beside the overlay, 7 reads the reader's samples, and 5 is the stream,
+  # which is already the command's output and error.
+  exec 5>&- 7<&- 8<&- 9>&-
   echo "$audit_marker" >/proc/self/loginuid || die "cannot mark the command for audit" 2>/proc/1/fd/2
   # No core dumps from the command, so the kernel starts no coredump helper.
   ulimit -c 0
   exec timeout --kill-after=10 "$QIM_TIMEOUT" "${runner[@]}" env LANG=C.UTF-8 TERM=dumb "${argv[@]}"
-) </dev/null >/run/qim/meta/command.log 2>&1
+) </dev/null >&5 2>&1
 echo "$?" >/run/qim/meta/exit_code
+exec 5>&-
 
 # Stop the reader before any further exec. On SIGTERM it drains the kernel queue
 # until the backlog is 0, writes its final status as the last samples line, and
@@ -198,10 +215,12 @@ cd /
 for _ in 1 2 3; do
   for entry in /proc/[0-9]*; do
     pid=${entry#/proc/}
-    [ "$pid" = 1 ] || [ "$pid" = "$reader" ] || kill -9 "$pid" 2>/dev/null
+    [ "$pid" = 1 ] || [ "$pid" = "$reader" ] || [ "$pid" = "$stream" ] || kill -9 "$pid" 2>/dev/null
   done
   sleep 0.5
 done
+# Every other writer is gone, so tee reads the end of the output and exits.
+wait "$stream"
 # The packages the command ran with, for the host to compare with its own.
 pacman -Q >/run/qim/meta/packages 2>/dev/null
 sync

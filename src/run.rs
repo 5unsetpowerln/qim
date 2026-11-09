@@ -13,12 +13,15 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 use std::time::Duration;
 
 use tar::{EntryType, Header};
 
 use crate::guest_tar::{self, Records};
 use crate::image::{self, at};
+use crate::terminal::TerminalFilter;
 use crate::{audit, network, profiles};
 
 /// The run's init, which /usr/lib/qim/boot starts from the input disk.
@@ -316,6 +319,9 @@ fn crosvm_args(base: &Path, work: &Path, output_dir: &Path, memory_mib: u64, cpu
         format!("tap-name={}", network::TAP).into(),
         "--serial".into(),
         option("type=file,path=", output_dir.join("console.log"), ",hardware=serial,console"),
+        // The command's output while it runs (/dev/hvc0), which qim shows.
+        "--serial".into(),
+        option("type=file,path=", work.join("stream"), ",hardware=virtio-console,num=1"),
         "-p".into(),
         "init=/usr/lib/qim/boot quiet audit=1".into(),
         base.join("vmlinuz").into(),
@@ -376,20 +382,31 @@ pub fn run(
         sparse_file(&work.join("audit.raw"), AUDIT_DISK_SIZE)?;
         let mut command = Command::new("crosvm");
         command.args(crosvm_args(base, work, output_dir, memory_mib, cpus));
-        let waited = {
-            let network = network::guest_network(output_dir)?;
-            let log_path = output_dir.join("crosvm.log");
-            let log = File::create(&log_path).map_err(at(&log_path))?;
-            let log_for_stderr = log.try_clone().map_err(at(&log_path))?;
-            let mut child = image::spawn(command.stdout(log).stderr(log_for_stderr))?;
-            let waited = image::wait(&command, &mut child, Some(Duration::from_secs(timeout + 300)));
-            if waited.is_ok() {
-                for problem in network.finish() {
-                    eprintln!("qim: warning: the network record may be incomplete: {problem}");
+        let stream = work.join("stream");
+        File::create(&stream).map_err(at(&stream))?;
+        let stop = AtomicBool::new(false);
+        let waited = thread::scope(|scope| {
+            let shown = scope.spawn(|| show_stream(&stream, &stop));
+            let waited = (|| {
+                let network = network::guest_network(output_dir)?;
+                let log_path = output_dir.join("crosvm.log");
+                let log = File::create(&log_path).map_err(at(&log_path))?;
+                let log_for_stderr = log.try_clone().map_err(at(&log_path))?;
+                let mut child = image::spawn(command.stdout(log).stderr(log_for_stderr))?;
+                let waited = image::wait(&command, &mut child, Some(Duration::from_secs(timeout + 300)));
+                if waited.is_ok() {
+                    for problem in network.finish() {
+                        eprintln!("qim: warning: the network record may be incomplete: {problem}");
+                    }
                 }
+                waited
+            })();
+            stop.store(true, Ordering::Relaxed);
+            if let Err(error) = shown.join().expect("showing the stream does not panic") {
+                eprintln!("qim: warning: cannot show the command's output: {error}");
             }
             waited
-        };
+        });
         // The records written so far are kept even when the guest had to be stopped.
         extract_audit_log(&work.join("audit.raw"), &output_dir.join("audit.log"))?;
         waited?;
@@ -420,8 +437,36 @@ pub fn run(
         .trim()
         .parse()
         .map_err(|_| format!("{}: not an exit status: {exit_code:?}", exit_code_path.display()))?;
+    eprintln!("qim: the command exited with status {code}");
     // As a process exit status, only the low 8 bits count.
     Ok(code as u8)
+}
+
+/// Show the command's output, which crosvm writes into `path` as the guest
+/// sends it, on standard output, until `stop` is set and the file is read to
+/// its end. The guest decides what it writes, so what could control the
+/// terminal is filtered out.
+fn show_stream(path: &Path, stop: &AtomicBool) -> io::Result<()> {
+    let mut file = File::open(path)?;
+    let mut filter = TerminalFilter::default();
+    let mut buffer = vec![0u8; 1 << 16];
+    let mut shown = Vec::new();
+    loop {
+        let stopping = stop.load(Ordering::Relaxed);
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            if stopping {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(100));
+            continue;
+        }
+        shown.clear();
+        filter.push(&buffer[..count], &mut shown);
+        let mut stdout = io::stdout().lock();
+        stdout.write_all(&shown)?;
+        stdout.flush()?;
+    }
 }
 
 /// Compare the guest's packages (meta/packages, `pacman -Q` at the end of the
