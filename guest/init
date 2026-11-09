@@ -169,6 +169,10 @@ log "running: ${argv[*]}"
 # CAP_AUDIT_CONTROL, which the command's bounding set drops, so the command and
 # every descendant (fork and exec inherit it, sudo keeps it) stay marked.
 (
+  # The init's own descriptors (fds opened by `exec N>` are inherited) must
+  # not reach the command: 9 writes the output disk, 8 opens the upper layer
+  # beside the overlay, 7 reads the reader's samples.
+  exec 7<&- 8<&- 9>&-
   echo "$audit_marker" >/proc/self/loginuid || die "cannot mark the command for audit" 2>/proc/1/fd/2
   # No core dumps from the command, so the kernel starts no coredump helper.
   ulimit -c 0
