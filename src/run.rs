@@ -34,7 +34,6 @@ const AUDIT_DISK_SIZE: u64 = 64 << 30;
 const META_FILES: &[&str] = &[
     "meta/exit_code",
     "meta/command.log",
-    "meta/audit_status",
     "meta/audit_reader_exit",
     "meta/samples",
     "meta/dmesg",
@@ -463,6 +462,10 @@ fn write_events(output_dir: &Path) {
 ///
 /// The kernel's lost counter alone is not enough: records produced while no
 /// reader is registered go to the kernel log instead, without being counted.
+/// The reader writes its final audit status (queried just before it drained and
+/// stopped) as the last line of meta/samples, in the form
+/// `status pid=<N> lost=<N> backlog=<N>`; its exit status is in
+/// meta/audit_reader_exit.
 pub fn recording_problems(meta_dir: &Path) -> Vec<String> {
     let read = |name: &str| {
         let path = meta_dir.join(name);
@@ -474,23 +477,31 @@ pub fn recording_problems(meta_dir: &Path) -> Vec<String> {
             }
         })
     };
-    let (status, reader_exit) = match (read("audit_status"), read("audit_reader_exit")) {
-        (Ok(status), Ok(reader_exit)) => (status, reader_exit),
+    let (samples, reader_exit) = match (read("samples"), read("audit_reader_exit")) {
+        (Ok(samples), Ok(reader_exit)) => (samples, reader_exit),
         (Err(problem), _) | (_, Err(problem)) => return vec![problem],
     };
-    let status: HashMap<&str, &str> = status
-        .lines()
-        .filter(|line| line.contains(' '))
-        .filter_map(|line| line.trim_start().split_once(char::is_whitespace))
-        .map(|(key, value)| (key, value.trim()))
-        .collect();
     let mut problems = Vec::new();
-    let lost = status.get("lost").copied();
-    if lost != Some("0") {
-        problems.push(format!("the kernel lost {} records", lost.unwrap_or("?")));
-    }
-    if status.get("pid").copied().unwrap_or("0") == "0" {
-        problems.push("the reader was no longer registered when the command ended".to_string());
+    let status: Option<HashMap<&str, &str>> = samples
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix("status "))
+        .map(|fields| fields.split_whitespace().filter_map(|field| field.split_once('=')).collect());
+    match status {
+        None => problems.push("the reader wrote no final status".to_string()),
+        Some(status) => {
+            let lost = status.get("lost").copied();
+            if lost != Some("0") {
+                problems.push(format!("the kernel lost {} records", lost.unwrap_or("?")));
+            }
+            let backlog = status.get("backlog").copied();
+            if backlog != Some("0") {
+                problems.push(format!("the reader stopped with {} records still queued", backlog.unwrap_or("?")));
+            }
+            if status.get("pid").copied().unwrap_or("0") == "0" {
+                problems.push("the reader was no longer registered when the command ended".to_string());
+            }
+        }
     }
     let reader_exit = reader_exit.trim();
     if reader_exit != "0" {
@@ -742,14 +753,21 @@ mod tests {
         assert!(pax_payload(&[record]).starts_with(b"101 k=v"));
     }
 
-    const STATUS: &str = "enabled 1\nfailure 1\npid {pid}\nrate_limit 0\nbacklog_limit 0\nlost {lost}\nbacklog 0\n";
+    // The reader writes samples, then its final status as the last line.
+    const SAMPLES: &str =
+        "t=0 backlog=0 lost=0 mem_available_kb=1000\nt=5 backlog=0 lost={lost} mem_available_kb=900\nstatus pid={pid} lost={lost} backlog={backlog}\n";
 
-    fn problems(pid: &str, lost: &str, reader_exit: &str) -> Vec<String> {
+    fn problems_with(pid: &str, lost: &str, backlog: &str, reader_exit: &str) -> Vec<String> {
         let directory = TempDir::new(&std::env::temp_dir()).unwrap();
         let meta = directory.path();
-        fs::write(meta.join("audit_status"), STATUS.replace("{pid}", pid).replace("{lost}", lost)).unwrap();
+        let samples = SAMPLES.replace("{pid}", pid).replace("{lost}", lost).replace("{backlog}", backlog);
+        fs::write(meta.join("samples"), samples).unwrap();
         fs::write(meta.join("audit_reader_exit"), format!("{reader_exit}\n")).unwrap();
         recording_problems(meta)
+    }
+
+    fn problems(pid: &str, lost: &str, reader_exit: &str) -> Vec<String> {
+        problems_with(pid, lost, "0", reader_exit)
     }
 
     #[test]
@@ -760,8 +778,18 @@ mod tests {
     #[test]
     fn each_reason_is_reported() {
         assert_eq!(problems("117", "3", "0"), ["the kernel lost 3 records"]);
+        assert_eq!(problems_with("117", "0", "5", "0"), ["the reader stopped with 5 records still queued"]);
         assert_eq!(problems("0", "0", "0"), ["the reader was no longer registered when the command ended"]);
         assert_eq!(problems("117", "0", "2"), ["the reader exited with status 2"]);
+    }
+
+    #[test]
+    fn a_missing_final_status_line_is_a_problem() {
+        let directory = TempDir::new(&std::env::temp_dir()).unwrap();
+        let meta = directory.path();
+        fs::write(meta.join("samples"), "t=0 backlog=0 lost=0 mem_available_kb=1000\n").unwrap();
+        fs::write(meta.join("audit_reader_exit"), "0\n").unwrap();
+        assert_eq!(recording_problems(meta), ["the reader wrote no final status"]);
     }
 
     #[test]

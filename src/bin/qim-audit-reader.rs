@@ -1,6 +1,6 @@
 //! Receive audit records from the kernel and write them to a raw disk.
 //!
-//! Usage: qim-audit-reader <device>
+//! Usage: qim-audit-reader <device> <samples>
 //!
 //! Registers itself as the audit daemon, configures the kernel queue so that it
 //! never drops records for backlog or rate reasons, and writes every record as a
@@ -11,18 +11,27 @@
 //! EOE records are not written, matching auditd's RAW logs. The lines go to the
 //! device from its start, through O_DIRECT, so that what has been written
 //! survives a guest that crashes or is killed; lines never contain NUL, so the
-//! records end at the first NUL on the disk (see Spool). SIGTERM makes the
-//! reader drain what the socket already holds, flush and exit. The exit status
-//! is 0, 1 if the kernel rejected the registration or writing failed, or 2 if
-//! the socket ever overflowed (ENOBUFS), in which case records may be missing
-//! even though the kernel's lost counter does not say so.
+//! records end at the first NUL on the disk (see Spool).
+//!
+//! While receiving, the reader also writes diagnostics to the <samples> file,
+//! one line every few seconds with the seconds elapsed, the kernel's audit
+//! backlog and lost counters (queried with AUDIT_GET) and MemAvailable (read
+//! from /proc/meminfo). It does this itself so that the init need not exec a
+//! sampler while the records are being collected. On SIGTERM it drains the
+//! kernel queue until the backlog reaches 0, writes a final `status` line with
+//! the registered daemon pid and the last lost and backlog counts, and exits.
+//! The init reports that final line and this exit status to the host.
+//!
+//! The exit status is 0, 1 if the kernel rejected the registration or writing
+//! failed, or 2 if the socket ever overflowed (ENOBUFS), in which case records
+//! may be missing even though the kernel's lost counter does not say so.
 
 use std::borrow::Cow;
 use std::fs::{File, OpenOptions};
-use std::io;
+use std::io::{self, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -30,6 +39,7 @@ use std::time::{Duration, Instant};
 const NLMSG_ERROR: u16 = 2;
 const NLM_F_REQUEST: u16 = 0x1;
 const NLM_F_ACK: u16 = 0x4;
+const AUDIT_GET: u16 = 1000;
 const AUDIT_SET: u16 = 1001;
 const AUDIT_EOE: u16 = 1320;
 const STATUS_ENABLED: u32 = 0x1;
@@ -41,10 +51,15 @@ const FAILURE_PRINTK: u32 = 1;
 /// struct nlmsghdr: length, type, flags, sequence number, port id.
 const HEADER_LENGTH: usize = 16;
 /// How long the receive call waits for a record before the loop checks
-/// whether to flush or stop.
+/// whether to flush, sample or stop.
 const TICK: Duration = Duration::from_millis(100);
 /// A line waits at most this long (plus one tick) before it is on the disk.
 const FLUSH_AFTER: Duration = Duration::from_millis(400);
+/// How often a diagnostic sample line is written.
+const SAMPLE_EVERY: Duration = Duration::from_secs(5);
+/// After SIGTERM, how long the reader keeps draining before it gives up on the
+/// backlog reaching 0 (a leftover process could keep producing records).
+const DRAIN_DEADLINE: Duration = Duration::from_secs(600);
 /// Blocks per full write.
 const CHUNK_BLOCKS: usize = 256;
 
@@ -71,6 +86,38 @@ fn status_message(pid: u32) -> Vec<u8> {
         message.extend(field.to_ne_bytes());
     }
     message
+}
+
+/// A bare AUDIT_GET request: the kernel replies with the current audit status.
+fn get_status_message() -> Vec<u8> {
+    let mut message = Vec::with_capacity(HEADER_LENGTH);
+    message.extend((HEADER_LENGTH as u32).to_ne_bytes());
+    message.extend(AUDIT_GET.to_ne_bytes());
+    message.extend(NLM_F_REQUEST.to_ne_bytes());
+    message.extend(1u32.to_ne_bytes());
+    message.extend(0u32.to_ne_bytes());
+    message
+}
+
+/// The fields of struct audit_status that the reader reports.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct AuditStatus {
+    /// The pid registered as the audit daemon (0 if none).
+    pid: u32,
+    /// Records the kernel dropped for lack of a reader or buffer space.
+    lost: u32,
+    /// Records queued in the kernel, not yet delivered to the socket.
+    backlog: u32,
+}
+
+impl AuditStatus {
+    /// Parse the struct audit_status in an AUDIT_GET reply: an array of u32,
+    /// whose fields are mask, enabled, failure, pid, rate_limit, backlog_limit,
+    /// lost, backlog, ...
+    fn parse(payload: &[u8]) -> Option<AuditStatus> {
+        let field = |index: usize| payload.get(index * 4..index * 4 + 4).map(|slice| u32::from_ne_bytes(slice.try_into().unwrap()));
+        Some(AuditStatus { pid: field(3)?, lost: field(6)?, backlog: field(7)? })
+    }
 }
 
 fn type_name(kind: u16) -> Cow<'static, str> {
@@ -141,6 +188,8 @@ enum Datagram {
     Skip,
     /// The kernel rejected the request with this (negative) errno.
     Rejected(i32),
+    /// A reply to an AUDIT_GET query, not a record.
+    Status(AuditStatus),
     /// A record line, ending with a newline.
     Line(Vec<u8>),
 }
@@ -158,6 +207,8 @@ fn classify(datagram: &[u8]) -> Datagram {
             Some(error) => Datagram::Rejected(error),
             None => Datagram::Rejected(-libc::EBADMSG),
         },
+        // The reader queries AUDIT_GET for diagnostics; its reply is not a record.
+        AUDIT_GET => AuditStatus::parse(payload).map_or(Datagram::Skip, Datagram::Status),
         AUDIT_EOE => Datagram::Skip,
         kind => {
             let end = payload.iter().rposition(|&byte| byte != 0 && byte != b'\n').map_or(0, |last| last + 1);
@@ -309,14 +360,77 @@ fn write_failed(error: io::Error) -> String {
     format!("write: {error}")
 }
 
+/// The diagnostic samples the reader writes to the init, so that the init need
+/// not exec a sampler while the records are collected.
+struct Samples {
+    out: File,
+    /// /proc/meminfo, opened once and re-read from the start each sample.
+    meminfo: File,
+}
+
+impl Samples {
+    fn new(path: &Path) -> Result<Samples, String> {
+        let out = File::create(path).map_err(|error| format!("{}: {error}", path.display()))?;
+        let meminfo = File::open("/proc/meminfo").map_err(|error| format!("/proc/meminfo: {error}"))?;
+        Ok(Samples { out, meminfo })
+    }
+
+    /// MemAvailable in kibibytes, or 0 if it cannot be read.
+    fn mem_available_kb(&self) -> u64 {
+        let mut buffer = [0u8; 8192];
+        let read = self.meminfo.read_at(&mut buffer, 0).unwrap_or(0);
+        String::from_utf8_lossy(&buffer[..read])
+            .lines()
+            .find_map(|line| line.strip_prefix("MemAvailable:"))
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0)
+    }
+
+    fn write_line(&mut self, line: &str) -> Result<(), String> {
+        self.out.write_all(line.as_bytes()).map_err(|error| format!("samples: {error}"))
+    }
+
+    fn sample(&mut self, elapsed: Duration, status: AuditStatus) -> Result<(), String> {
+        let line = format!(
+            "t={} backlog={} lost={} mem_available_kb={}\n",
+            elapsed.as_secs(),
+            status.backlog,
+            status.lost,
+            self.mem_available_kb()
+        );
+        self.write_line(&line)
+    }
+
+    /// The last line: what the host checks to know the record is complete.
+    fn final_status(&mut self, status: Option<AuditStatus>) -> Result<(), String> {
+        let status = status.unwrap_or(AuditStatus { pid: 0, lost: 0, backlog: 0 });
+        let line = format!("status pid={} lost={} backlog={}\n", status.pid, status.lost, status.backlog);
+        self.write_line(&line)
+    }
+}
+
+fn send_get(socket: &OwnedFd) -> Result<(), String> {
+    let message = get_status_message();
+    // SAFETY: the message is valid for its length.
+    if unsafe { libc::send(socket.as_raw_fd(), message.as_ptr().cast(), message.len(), 0) } < 0 {
+        return Err(os_error("send"));
+    }
+    Ok(())
+}
+
 fn run() -> Result<u8, String> {
-    let path = PathBuf::from(std::env::args_os().nth(1).ok_or("usage: qim-audit-reader <device>")?);
+    let mut args = std::env::args_os().skip(1);
+    let usage = "usage: qim-audit-reader <device> <samples>";
+    let path = PathBuf::from(args.next().ok_or(usage)?);
+    let samples_path = PathBuf::from(args.next().ok_or(usage)?);
     let device = OpenOptions::new()
         .write(true)
         .custom_flags(libc::O_DIRECT)
         .open(&path)
         .map_err(|error| format!("{}: {error}", path.display()))?;
     let mut spool = Spool::new(device, CHUNK_BLOCKS);
+    let mut samples = Samples::new(&samples_path)?;
     let socket = audit_socket()?;
     let message = status_message(std::process::id());
     // SAFETY: the message is valid for its length.
@@ -328,28 +442,62 @@ fn run() -> Result<u8, String> {
     let tick = libc::timeval { tv_sec: TICK.as_secs() as _, tv_usec: TICK.subsec_micros() as _ };
     set_socket_option(&socket, libc::SO_RCVTIMEO, &tick)?;
     // Whatever ends the loop, the lines received so far go to the disk.
-    let received = receive(&socket, &mut spool);
+    let received = receive(&socket, &mut spool, &mut samples);
     let flushed = spool.flush().map_err(write_failed);
     let code = received?;
     flushed?;
     Ok(code)
 }
 
-/// Write records to the spool until SIGTERM, then drain the socket; the
-/// result is the exit status.
-fn receive(socket: &OwnedFd, spool: &mut Spool<File>) -> Result<u8, String> {
+/// Write records to the spool until SIGTERM, then drain the kernel queue until
+/// the backlog reaches 0, sampling the audit status throughout; the result is
+/// the exit status.
+///
+/// The AUDIT_GET reply is asynchronous: when a sample is due, or the backlog
+/// must be checked while stopping, one query is sent and its reply (a
+/// `Status` datagram) is used when it arrives. Records keep flowing meanwhile
+/// and are written as usual.
+fn receive(socket: &OwnedFd, spool: &mut Spool<File>, samples: &mut Samples) -> Result<u8, String> {
     let mut buffer = vec![0u8; 1 << 16];
     let mut overflows = 0u64;
     // When the oldest line that is not on the disk yet was appended.
     let mut pending_since: Option<Instant> = None;
+    let start = Instant::now();
+    // The next elapsed time at which to sample; a sample is taken at once.
+    let mut next_sample = Duration::ZERO;
+    // The elapsed time captured when a sample's query was sent, pending its reply.
+    let mut sampling: Option<Duration> = None;
+    // Whether an AUDIT_GET reply is still awaited.
+    let mut querying = false;
+    let mut draining_since: Option<Instant> = None;
+    let mut last_status: Option<AuditStatus> = None;
+    let mut drained = false;
     loop {
+        let elapsed = start.elapsed();
+        if sampling.is_none() && elapsed >= next_sample {
+            sampling = Some(elapsed);
+            next_sample = elapsed + SAMPLE_EVERY;
+            if !querying {
+                send_get(socket)?;
+                querying = true;
+            }
+        }
         // SAFETY: the buffer is valid for its length.
         let received = unsafe { libc::recv(socket.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len(), 0) };
         if received < 0 {
             let error = io::Error::last_os_error();
             match error.raw_os_error() {
-                // A tick passed without a record.
-                Some(libc::EAGAIN) if STOPPING.load(Ordering::SeqCst) => break,
+                Some(libc::EAGAIN) if STOPPING.load(Ordering::SeqCst) => {
+                    // Keep draining until the kernel queue is empty, then stop.
+                    let since = *draining_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= DRAIN_DEADLINE {
+                        break;
+                    }
+                    if !querying {
+                        send_get(socket)?;
+                        querying = true;
+                    }
+                }
                 Some(libc::EAGAIN | libc::EINTR) => {}
                 Some(libc::ENOBUFS) => overflows += 1,
                 _ => return Err(format!("recv: {error}")),
@@ -360,6 +508,17 @@ fn receive(socket: &OwnedFd, spool: &mut Spool<File>) -> Result<u8, String> {
                 Datagram::Rejected(error) => {
                     eprintln!("audit-reader: kernel rejected a request: errno {}", -error);
                     return Ok(1);
+                }
+                Datagram::Status(status) => {
+                    querying = false;
+                    last_status = Some(status);
+                    if let Some(elapsed) = sampling.take() {
+                        samples.sample(elapsed, status)?;
+                    }
+                    if STOPPING.load(Ordering::SeqCst) && status.backlog == 0 {
+                        drained = true;
+                        break;
+                    }
                 }
                 Datagram::Line(line) => {
                     spool.append(&line).map_err(write_failed)?;
@@ -372,9 +531,13 @@ fn receive(socket: &OwnedFd, spool: &mut Spool<File>) -> Result<u8, String> {
             pending_since = None;
         }
     }
+    samples.final_status(last_status)?;
     if overflows > 0 {
         eprintln!("audit-reader: the socket overflowed {overflows} times");
         return Ok(2);
+    }
+    if !drained {
+        eprintln!("audit-reader: gave up draining; the backlog did not reach 0");
     }
     Ok(0)
 }
@@ -444,6 +607,25 @@ mod tests {
         payload.extend([0; 16]);
         assert_eq!(classify(&datagram(NLMSG_ERROR, 36, &payload)), Datagram::Rejected(-libc::EPERM));
         assert_eq!(classify(&datagram(NLMSG_ERROR, 16, b"")), Datagram::Rejected(-libc::EBADMSG));
+    }
+
+    #[test]
+    #[cfg(target_endian = "little")]
+    fn a_get_request_queries_the_status() {
+        // struct.pack("=IHHII", 16, 1000, 1, 1, 0)
+        assert_eq!(get_status_message(), b"\x10\x00\x00\x00\xe8\x03\x01\x00\x01\x00\x00\x00\x00\x00\x00\x00");
+    }
+
+    #[test]
+    fn an_audit_get_reply_is_parsed_as_a_status_not_a_record() {
+        // struct audit_status: mask, enabled, failure, pid, rate_limit,
+        // backlog_limit, lost, backlog, ... Here pid=117, lost=3, backlog=42.
+        let fields: [u32; 10] = [0, 1, 1, 117, 0, 320, 3, 42, 0, 0];
+        let payload: Vec<u8> = fields.iter().flat_map(|field| field.to_ne_bytes()).collect();
+        assert_eq!(
+            classify(&datagram(AUDIT_GET, payload.len() as u32, &payload)),
+            Datagram::Status(AuditStatus { pid: 117, lost: 3, backlog: 42 })
+        );
     }
 
     /// A disk in memory that accepts only what O_DIRECT accepts.

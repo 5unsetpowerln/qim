@@ -21,6 +21,16 @@ die() {
 # Opened before the root changes: the output disk and, below, the upper layer.
 exec 9>/dev/vdd || die "cannot open the output disk"
 
+# The reader writes diagnostic samples here and, as its last line, its final
+# status. It lives in the original root, so the init keeps a read fd to it
+# across pivot_root (which the overlay's own /run would otherwise hide) and
+# copies it into the output once the reader has stopped. It is created now,
+# before any audit rule, and owned by the reader's uid so the reader can write
+# it under its own uid.
+: >/run/qim/samples || die "cannot create the samples file"
+chown 999:999 /run/qim/samples || die "cannot hand the samples file to the reader"
+exec 7</run/qim/samples || die "cannot open the samples file"
+
 # The reader starts from the original root, so nothing in the overlay root
 # that the command sees refers to it or to the audit disk. It runs under its
 # own uid with only the capabilities it needs, so that a command that becomes
@@ -31,7 +41,7 @@ exec 9>/dev/vdd || die "cannot open the output disk"
 chown 999:999 /dev/vde || die "cannot hand the audit disk to the reader"
 reader_caps=+audit_control,+audit_read,+net_admin
 setpriv --reuid=999 --regid=999 --clear-groups --inh-caps="-all,$reader_caps" --ambient-caps="$reader_caps" \
-  "$in/audit-reader" /dev/vde 9>&- 2>/dev/console &
+  "$in/audit-reader" /dev/vde /run/qim/samples 9>&- 7<&- 2>/dev/console &
 reader=$!
 for _ in $(seq 50); do
   [ "$(auditctl -s | awk '$1 == "pid" {print $2}')" = "$reader" ] && break
@@ -40,9 +50,25 @@ done
 [ "$(auditctl -s | awk '$1 == "pid" {print $2}')" = "$reader" ] || die "the audit reader did not register"
 modprobe overlay || die "cannot load overlay"
 modprobe virtio_net || die "cannot load virtio_net"
-# Nothing may load code into the kernel from now on, and io_uring operations
-# would bypass the syscall audit rules.
-sysctl -q -w kernel.modules_disabled=1 kernel.io_uring_disabled=2 || die "cannot restrict the kernel"
+# The kernel starts helper programs (usermode helpers) with an unset loginuid
+# and, by default, every capability. pivot_root moves their paths into the
+# writable overlay, so a root command could replace one and have the kernel run
+# it outside the command's bounding set. Close that: an empty modprobe path
+# disables module autoloading entirely; a plain core_pattern (not a pipe) stops
+# the coredump helper, and the command gets RLIMIT_CORE 0 so no core is written
+# either; empty usermodehelper bounding and inheritable sets leave any remaining
+# helper (the hardcoded request-key) no capabilities. Nothing may load code into
+# the kernel from now on, and io_uring operations would bypass the audit rules.
+# usermodehelper.bset and .inheritable are 64-bit capability masks the kernel
+# reads as two 32-bit words (low high); a single "0" clears only the low word,
+# so "0 0" is needed to leave a helper no capabilities at all.
+sysctl -q -w \
+  kernel.modprobe= \
+  kernel.core_pattern=core \
+  kernel.usermodehelper.bset="0 0" \
+  kernel.usermodehelper.inheritable="0 0" \
+  kernel.modules_disabled=1 \
+  kernel.io_uring_disabled=2 || die "cannot restrict the kernel"
 
 mkdir -p /run/qim/upper-disk /run/qim/root
 mount -t ext4 /dev/vdb /run/qim/upper-disk || die "cannot mount the upper disk"
@@ -89,26 +115,12 @@ ip addr add "$QIM_ADDRESS" dev eth0
 ip link set eth0 up
 ip route add default via "$QIM_GATEWAY"
 
-# The rules record only processes whose loginuid (auid) is this marker: the
-# command and its descendants (see where the command starts). The init's own
-# steps, the sampler and the reader keep the unset loginuid and are not recorded.
-audit_marker=4242
-auditctl -D >/dev/null
-for rule in \
-  "-S execve,execveat -k exec" \
-  "-S open,openat,openat2,creat -k open" \
-  "-S unlink,unlinkat,rename,renameat,renameat2,mkdir,mkdirat,rmdir,link,linkat,symlink,symlinkat -k fsmod" \
-  "-S chdir,fchdir,dup,dup2,dup3,close,close_range,fcntl -k fd" \
-  "-S clone,clone3,fork,vfork -k proc" \
-  "-S connect,sendto,sendmsg,sendmmsg -k net"; do
-  # shellcheck disable=SC2086
-  auditctl -a always,exit -F arch=b64 -F auid="$audit_marker" $rule >/dev/null || die "cannot add audit rule: $rule"
-done
-auditctl -e 2 >/dev/null || die "cannot lock the audit configuration"
-
-# Capabilities the command never gets, even as root through sudo: creating
-# device nodes, mounting, loading modules, raw I/O, tracing or signalling
-# other users' processes (the audit reader), changing audit or the network.
+# The command runs under a reduced bounding set in a home directory, both
+# resolved now, before any audit rule, so that getent and the rest do not exec
+# once recording is on. Capabilities the command never gets, even as root
+# through sudo: creating device nodes, mounting, loading modules, raw I/O,
+# tracing or signalling other users' processes (the audit reader), changing
+# audit or the network.
 drop=-mknod,-sys_admin,-sys_module,-sys_rawio,-sys_ptrace,-sys_boot,-audit_control,-audit_read,-kill,-net_admin,-net_raw,-mac_admin,-mac_override,-bpf,-perfmon,-syslog,-sys_time
 
 mkdir -p /run/qim/meta
@@ -121,27 +133,35 @@ else
 fi
 cd "$home" || die "no home directory $home"
 
-# Diagnostics, one line every 5 seconds while the command runs: seconds since
-# it started, the kernel's audit backlog and lost counters, and MemAvailable.
-sample() {
-  local pause=
-  # Stop at once, without leaving the sleep behind.
-  trap '[ -z "$pause" ] || kill "$pause"; exit 0' TERM
-  SECONDS=0
-  while :; do
-    { auditctl -s; cat /proc/meminfo; } | awk -v t="$SECONDS" '
-      $1 == "backlog" { backlog = $2 }
-      $1 == "lost" { lost = $2 }
-      $1 == "MemAvailable:" { available = $2 }
-      END { printf "t=%s backlog=%s lost=%s mem_available_kb=%s\n", t, backlog, lost, available }'
-    sleep 5 &
-    pause=$!
-    wait "$pause"
-    pause=
-  done
-}
-sample >/run/qim/meta/samples 2>&1 &
-sampler=$!
+# The marker rules record only processes whose loginuid (auid) is this marker:
+# the command and its descendants (see where the command starts). The helper
+# rule additionally records exec by processes whose loginuid is unset, which is
+# how the kernel's usermode helpers run: so a helper the command replaced in the
+# overlay shows in the record. The init itself keeps the unset loginuid, so once
+# the helper rule is in place no init step may exec until the reader has stopped,
+# except the command, which marks itself before its first exec.
+#
+# All of this is loaded with one `auditctl -R`: its own execve happens before it
+# reads the file, so it is not caught by the helper rule the file installs, and
+# the final -e 2 (which locks the configuration) is applied over netlink, not by
+# a further exec. Installing the rules one auditctl at a time would record the
+# exec that applies the lock. The rules file is built with shell builtins only.
+audit_marker=4242
+rules=(
+  "-D"
+  "-a always,exit -F arch=b64 -F auid=$audit_marker -S execve,execveat -k exec"
+  "-a always,exit -F arch=b64 -F auid=$audit_marker -S open,openat,openat2,creat -k open"
+  "-a always,exit -F arch=b64 -F auid=$audit_marker -S unlink,unlinkat,rename,renameat,renameat2,mkdir,mkdirat,rmdir,link,linkat,symlink,symlinkat -k fsmod"
+  "-a always,exit -F arch=b64 -F auid=$audit_marker -S chdir,fchdir,dup,dup2,dup3,close,close_range,fcntl -k fd"
+  "-a always,exit -F arch=b64 -F auid=$audit_marker -S clone,clone3,fork,vfork -k proc"
+  "-a always,exit -F arch=b64 -F auid=$audit_marker -S connect,sendto,sendmsg,sendmmsg -k net"
+  "-a always,exit -F arch=b64 -F auid=4294967295 -S execve,execveat -k exec-helper"
+  "-e 2"
+)
+printf '%s\n' "${rules[@]}" >/run/qim/audit.rules
+# auditctl -R refuses a rules file writable by group or other.
+chmod 600 /run/qim/audit.rules
+auditctl -R /run/qim/audit.rules >/dev/null || die "cannot install the audit rules"
 
 log "running: ${argv[*]}"
 # The command's first process takes the audit marker as its loginuid. Setting
@@ -150,15 +170,27 @@ log "running: ${argv[*]}"
 # every descendant (fork and exec inherit it, sudo keeps it) stay marked.
 (
   echo "$audit_marker" >/proc/self/loginuid || die "cannot mark the command for audit" 2>/proc/1/fd/2
+  # No core dumps from the command, so the kernel starts no coredump helper.
+  ulimit -c 0
   exec timeout --kill-after=10 "$QIM_TIMEOUT" "${runner[@]}" env LANG=C.UTF-8 TERM=dumb "${argv[@]}"
 ) </dev/null >/run/qim/meta/command.log 2>&1
 echo "$?" >/run/qim/meta/exit_code
-kill "$sampler" 2>/dev/null
-wait "$sampler"
-cd /
 
-# Stop everything the command left behind so that the upper layer is quiet,
-# except the audit reader.
+# Stop the reader before any further exec. On SIGTERM it drains the kernel queue
+# until the backlog is 0, writes its final status as the last samples line, and
+# exits; the signal and the waits are shell builtins, so nothing is exec'd while
+# it still records. Its exit status tells the host whether the record is whole.
+kill -TERM "$reader"
+wait "$reader"
+echo "$?" >/run/qim/meta/audit_reader_exit
+
+# The reader is gone, so the execs below are no longer recorded (the kernel logs
+# them). Copy the samples out of the original root through the read fd kept
+# across pivot_root, quiet whatever the command left behind so the upper layer
+# is still, and sync before writing the output.
+cat <&7 >/run/qim/meta/samples
+exec 7<&-
+cd /
 for _ in 1 2 3; do
   for entry in /proc/[0-9]*; do
     pid=${entry#/proc/}
@@ -167,16 +199,6 @@ for _ in 1 2 3; do
   sleep 0.5
 done
 sync
-
-# Let the reader drain the kernel queue before it stops.
-for _ in $(seq 6000); do
-  [ "$(auditctl -s | awk '$1 == "backlog" {print $2}')" = 0 ] && break
-  sleep 0.1
-done
-auditctl -s >/run/qim/meta/audit_status
-kill -TERM "$reader"
-wait "$reader"
-echo "$?" >/run/qim/meta/audit_reader_exit
 # /dev/kmsg is not in this root; dmesg falls back to syslog(2).
 dmesg >/run/qim/meta/dmesg 2>&1
 # The S flag keeps symlink targets as they are; names and hard link targets move under upper/.
