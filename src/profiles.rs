@@ -72,9 +72,11 @@ pub const PROFILES: &[Profile] = &[
         user: Some("qim"),
         sudo_commands: &["/usr/bin/pacman"],
         setup: AUR_SETUP,
-        // makepkg puts the packages it builds (debug packages included) where the artifacts are taken from.
-        files: &[("/etc/makepkg.conf.d/qim.conf", "PKGDEST=/var/lib/qim/packages\n")],
-        user_dirs: &["/var/lib/qim/packages"],
+        // makepkg puts the packages it builds (debug packages included) where the
+        // artifacts are taken from. The user's makepkg.conf is read after the
+        // system's, which comes from the host, so this setting wins.
+        files: &[("/home/qim/.config/pacman/makepkg.conf", "PKGDEST=/var/lib/qim/packages\n")],
+        user_dirs: &["/var/lib/qim/packages", "/home/qim/.config", "/home/qim/.config/pacman"],
         include: &["/var/lib/qim/packages/*.pkg.tar.zst"],
         exclude: &[],
     },

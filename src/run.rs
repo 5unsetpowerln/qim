@@ -322,14 +322,13 @@ fn crosvm_args(base: &Path, work: &Path, output_dir: &Path, memory_mib: u64, cpu
 }
 
 pub fn run(
-    image_name: &str,
+    base: &Path,
     argv: &[OsString],
     output_dir: &Path,
     timeout: u64,
     memory_mib: u64,
     cpus: u32,
 ) -> Result<u8, String> {
-    let base = image::images_dir()?.join(image_name);
     let info_path = base.join("image.json");
     let info = fs::read(&info_path).map_err(at(&info_path))?;
     let info: serde_json::Value =
@@ -353,7 +352,7 @@ pub fn run(
         sparse_file(&work.join("output.raw"), OUTPUT_DISK_SIZE)?;
         sparse_file(&work.join("audit.raw"), AUDIT_DISK_SIZE)?;
         let mut command = Command::new("crosvm");
-        command.args(crosvm_args(&base, work, output_dir, memory_mib, cpus));
+        command.args(crosvm_args(base, work, output_dir, memory_mib, cpus));
         let waited = {
             let network = network::guest_network(output_dir)?;
             let log_path = output_dir.join("crosvm.log");

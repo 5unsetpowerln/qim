@@ -1,17 +1,22 @@
-//! Build a base guest image from a dated Arch Linux Archive snapshot.
+//! Build a base guest image that follows the host's pacman state.
 //!
-//! The packages come from https://archive.archlinux.org/repos/<date>/, so the
-//! image content and the repository packages the guest installs later are both
-//! fixed by the date. The image is built with pacman --root under bind mounts,
-//! because pacstrap needs a devtmpfs mount that rootless containers refuse.
+//! The image is built from the host's own pacman configuration (as pacman-conf
+//! expands it) and a copy of the host's sync databases, which are never
+//! refreshed, so the guest gets the package versions that the host's pacman
+//! would install now. paru's --chroot starts from the same configuration but
+//! refreshes to the mirrors' newest packages, which can be newer than the host.
+//! The host's makepkg configuration goes into the image as well. The image is
+//! named after a digest of this host state, so a change on the host leads to a
+//! new image. It is built with pacman --root under bind mounts, because
+//! pacstrap needs a devtmpfs mount that rootless containers refuse.
 //!
 //! This module also holds the helpers for running external commands, which
 //! turn a caught SIGINT or SIGTERM into an error so that every mount, network
 //! device and temporary directory is released on the way out.
 
 use std::cmp::Ordering;
-use std::ffi::CString;
-use std::fmt::{self, Write as _};
+use std::ffi::{CString, OsStr};
+use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -20,18 +25,22 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{self, AtomicI32};
 use std::thread::sleep;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
 use crate::network;
 use crate::profiles::{self, Profile};
+use crate::run::TempDir;
 
 /// Installed in the base image as /usr/lib/qim/boot.
 pub const BOOT: &[u8] = include_bytes!("../guest/boot");
 
-const ARCHIVE_SERVER: &str = "https://archive.archlinux.org/repos/{date}/$repo/os/$arch";
-const REPOSITORIES: &[&str] = &["core", "extra"];
+/// [options] keys that locate the host's own files. The guest's pacman.conf
+/// leaves them out, so that pacman uses its defaults inside the guest.
+const PATH_OPTIONS: &[&str] = &["RootDir", "DBPath", "CacheDir", "HookDir", "GPGDir", "LogFile"];
+
+const HOST_MAKEPKG_CONF: &str = "/etc/makepkg.conf";
 
 pub fn home() -> Result<PathBuf, String> {
     match std::env::var_os("QIM_HOME") {
@@ -46,118 +55,126 @@ pub fn images_dir() -> Result<PathBuf, String> {
     Ok(home()?.join("images"))
 }
 
-/// A calendar date, which names an archive snapshot.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Date {
-    year: u32,
-    month: u32,
-    day: u32,
+/// The host's pacman configuration split into what the guest uses and the
+/// host's own paths.
+#[derive(Debug, PartialEq)]
+pub struct PacmanConf {
+    /// The configuration without PATH_OPTIONS: the guest's /etc/pacman.conf.
+    pub text: String,
+    pub db_path: String,
+    pub cache_dirs: Vec<String>,
 }
 
-impl Date {
-    pub fn new(year: u32, month: u32, day: u32) -> Option<Date> {
-        let valid = (1..=9999).contains(&year)
-            && (1..=12).contains(&month)
-            && (1..=days_in_month(year, month)).contains(&day);
-        valid.then_some(Date { year, month, day })
-    }
-
-    /// Parse YYYY-MM-DD.
-    pub fn parse(text: &str) -> Result<Date, String> {
-        let number = |range: std::ops::Range<usize>| {
-            text.get(range)
-                .filter(|digits| digits.bytes().all(|byte| byte.is_ascii_digit()))
-                .and_then(|digits| digits.parse().ok())
-        };
-        let bytes = text.as_bytes();
-        let shaped = bytes.len() == 10 && bytes[4] == b'-' && bytes[7] == b'-';
-        shaped
-            .then(|| Date::new(number(0..4)?, number(5..7)?, number(8..10)?))
-            .flatten()
-            .ok_or_else(|| format!("invalid date: {text} (expected YYYY-MM-DD)"))
-    }
-
-    /// Today in UTC.
-    pub fn today() -> Date {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("the clock is set after 1970");
-        Date::from_days(now.as_secs() / 86_400)
-    }
-
-    /// The date `days` days after 1970-01-01 (the civil_from_days algorithm by Howard Hinnant).
-    fn from_days(days: u64) -> Date {
-        let shifted = days + 719_468;
-        let era = shifted / 146_097;
-        let day_of_era = shifted % 146_097;
-        let year_of_era = (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-        let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-        let month_from_march = (5 * day_of_year + 2) / 153;
-        let day = day_of_year - (153 * month_from_march + 2) / 5 + 1;
-        let month = if month_from_march < 10 { month_from_march + 3 } else { month_from_march - 9 };
-        let year = era * 400 + year_of_era + u64::from(month <= 2);
-        Date { year: year as u32, month: month as u32, day: day as u32 }
-    }
-
-    pub fn previous(self) -> Date {
-        match self {
-            Date { day: 2.., .. } => Date { day: self.day - 1, ..self },
-            Date { month: 2.., .. } => Date { month: self.month - 1, day: days_in_month(self.year, self.month - 1), ..self },
-            _ => Date { year: self.year - 1, month: 12, day: 31 },
+/// Split the output of pacman-conf, which writes every option of [options]
+/// (defaults included) and every repository with its servers.
+pub fn split_pacman_conf(expanded: &str) -> Result<PacmanConf, String> {
+    let mut in_options = false;
+    let mut lines = Vec::new();
+    let mut db_path = None;
+    let mut cache_dirs = Vec::new();
+    for line in expanded.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_options = trimmed == "[options]";
+        } else if in_options {
+            let (key, value) = trimmed.split_once('=').map_or((trimmed, ""), |(key, value)| (key.trim(), value.trim()));
+            if PATH_OPTIONS.contains(&key) {
+                match key {
+                    "DBPath" => db_path = Some(value.to_string()),
+                    "CacheDir" => cache_dirs.push(value.to_string()),
+                    _ => {}
+                }
+                continue;
+            }
         }
+        lines.push(line);
+    }
+    let db_path = db_path.ok_or("pacman-conf printed no DBPath")?;
+    Ok(PacmanConf { text: lines.join("\n") + "\n", db_path, cache_dirs })
+}
+
+/// `conf` with CacheDir lines at the start of [options]: pacman looks for a
+/// package in every cache directory and downloads into the first writable one.
+pub fn with_cache_dirs<'a>(conf: &str, cache_dirs: impl IntoIterator<Item = &'a str>) -> Result<String, String> {
+    let (before, after) = conf.split_once("[options]\n").ok_or("the pacman configuration has no [options]")?;
+    let lines: String = cache_dirs.into_iter().map(|directory| format!("CacheDir = {directory}\n")).collect();
+    Ok(format!("{before}[options]\n{lines}{after}"))
+}
+
+/// What an image is built from, read from the host.
+pub struct HostState {
+    pub pacman: PacmanConf,
+    /// The sync databases and their signatures as (file name, contents), sorted by name.
+    sync_dbs: Vec<(Vec<u8>, Vec<u8>)>,
+    /// makepkg.conf and makepkg.conf.d/*.conf (sorted) as (absolute path, contents).
+    makepkg: Vec<(PathBuf, Vec<u8>)>,
+}
+
+impl HostState {
+    pub fn read() -> Result<HostState, String> {
+        let expanded = output(&mut Command::new("pacman-conf"))?;
+        let expanded = String::from_utf8(expanded).map_err(|_| "pacman-conf printed invalid UTF-8".to_string())?;
+        let pacman = split_pacman_conf(&expanded)?;
+        let sync_dir = Path::new(&pacman.db_path).join("sync");
+        let mut sync_dbs = Vec::new();
+        for path in list_dir(&sync_dir)? {
+            let name = path.file_name().expect("a directory entry has a name").as_bytes().to_vec();
+            if name.ends_with(b".db") || name.ends_with(b".db.sig") {
+                sync_dbs.push((name, fs::read(&path).map_err(at(&path))?));
+            }
+        }
+        sync_dbs.sort();
+        if !sync_dbs.iter().any(|(name, _)| name.ends_with(b".db")) {
+            return Err(format!("no sync databases in {} (run pacman -Sy on the host first)", sync_dir.display()));
+        }
+        let main_conf = PathBuf::from(HOST_MAKEPKG_CONF);
+        let mut makepkg_paths: Vec<PathBuf> = list_dir(Path::new(&format!("{HOST_MAKEPKG_CONF}.d")))?
+            .into_iter()
+            .filter(|path| path.extension() == Some(OsStr::new("conf")))
+            .collect();
+        makepkg_paths.sort();
+        let mut makepkg = Vec::new();
+        for path in std::iter::once(main_conf).chain(makepkg_paths) {
+            let contents = fs::read(&path).map_err(at(&path))?;
+            makepkg.push((path, contents));
+        }
+        Ok(HostState { pacman, sync_dbs, makepkg })
     }
 
-    fn compact(self) -> String {
-        format!("{:04}{:02}{:02}", self.year, self.month, self.day)
+    /// A digest of everything an image of `profile` is built from: the host
+    /// state, the profile and the boot script baked into the image.
+    pub fn digest(&self, profile: &Profile) -> String {
+        let mut hasher = Sha256::new();
+        let mut field = |bytes: &[u8]| {
+            hasher.update((bytes.len() as u64).to_le_bytes());
+            hasher.update(bytes);
+        };
+        field(format!("{profile:?}").as_bytes());
+        field(BOOT);
+        field(self.pacman.text.as_bytes());
+        for (name, contents) in &self.sync_dbs {
+            field(name);
+            field(contents);
+        }
+        for (path, contents) in &self.makepkg {
+            field(path.as_os_str().as_bytes());
+            field(contents);
+        }
+        hex(&hasher.finalize())
     }
 }
 
-/// ISO 8601 (YYYY-MM-DD).
-impl fmt::Display for Date {
-    fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-        write!(formatter, "{:04}-{:02}-{:02}", self.year, self.month, self.day)
+/// The image of `profile` for the host's current state, built first if it does not exist yet.
+pub fn ensure(profile_name: &str) -> Result<PathBuf, String> {
+    let profile = profiles::get(profile_name)?;
+    let state = HostState::read()?;
+    let name = format!("{}-{}", profile.name, &state.digest(profile)[..16]);
+    let base = images_dir()?.join(&name);
+    if !base.exists() {
+        eprintln!("qim: building the {} image {name} for the host's current pacman state", profile.name);
+        build(profile, &state, &name, &base)?;
     }
-}
-
-fn days_in_month(year: u32, month: u32) -> u32 {
-    match month {
-        2 if year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400)) => 29,
-        2 => 28,
-        4 | 6 | 9 | 11 => 30,
-        _ => 31,
-    }
-}
-
-/// The previous day (UTC): the archive for the current day may still be incomplete.
-pub fn default_date(today: Date) -> Date {
-    today.previous()
-}
-
-/// A pacman.conf for the snapshot of `date`.
-///
-/// It deliberately has no NoExtract lines: container images commonly exclude
-/// etc/pacman.conf, the mirrorlist, man pages and locales, and those
-/// exclusions must not leak into the guest. The archive is a single, slow
-/// server that sometimes stalls, and there is no other server to fall back
-/// to, so pacman's low-speed abort is disabled; the run's timeout bounds the
-/// time instead.
-pub fn pacman_conf(date: Date, cache_dir: Option<&str>) -> String {
-    let server = ARCHIVE_SERVER.replace("{date}", &format!("{:04}/{:02}/{:02}", date.year, date.month, date.day));
-    let mut lines: Vec<String> = [
-        "[options]",
-        "Architecture = auto",
-        "SigLevel = Required DatabaseOptional",
-        "LocalFileSigLevel = Optional",
-        "ParallelDownloads = 5",
-        "DisableDownloadTimeout",
-    ]
-    .map(String::from)
-    .into();
-    if let Some(cache_dir) = cache_dir {
-        lines.push(format!("CacheDir = {cache_dir}"));
-    }
-    for repository in REPOSITORIES {
-        lines.extend([String::new(), format!("[{repository}]"), format!("Server = {server}")]);
-    }
-    lines.join("\n") + "\n"
+    Ok(base)
 }
 
 // --- External commands and signals -------------------------------------------
@@ -362,19 +379,20 @@ fn configure(root: &Path, profile: &Profile) -> Result<(), String> {
     Ok(())
 }
 
-/// Add the profile's files and directories. This comes after the setup script
+/// Add the profile's directories and files. This comes after the setup script
 /// so that they do not affect it: with the aur profile's PKGDEST, the package
-/// built for paru would otherwise stay in the image.
+/// built for paru would otherwise stay in the image. The directories come
+/// first, so that a file may go below a directory owned by the profile's user.
 fn add_profile_files(root: &Path, profile: &Profile) -> Result<(), String> {
+    let user = profile.user.unwrap_or("root");
+    for directory in profile.user_dirs {
+        run(chroot(root).args(["install", "-d", "-m", "0755", "-o", user, "-g", user, directory]))?;
+    }
     for (path, contents) in profile.files {
         let target = root.join(path.trim_start_matches('/'));
         let parent = target.parent().expect("a path below root");
         fs::create_dir_all(parent).map_err(at(parent))?;
         write(&target, contents)?;
-    }
-    let user = profile.user.unwrap_or("root");
-    for directory in profile.user_dirs {
-        run(chroot(root).args(["install", "-d", "-m", "0755", "-o", user, "-g", user, directory]))?;
     }
     Ok(())
 }
@@ -398,36 +416,61 @@ fn copy_contents(source: &Path, target: &Path) -> Result<(), String> {
     Ok(())
 }
 
-pub fn build(profile_name: &str, date: Date, name: Option<&str>) -> Result<PathBuf, String> {
+/// Replace the image's makepkg configuration with the host's: makepkg.conf and
+/// exactly the host's makepkg.conf.d/*.conf.
+fn install_makepkg_conf(root: &Path, state: &HostState) -> Result<(), String> {
+    let conf_d = root.join("etc/makepkg.conf.d");
+    for old in list_dir(&conf_d)? {
+        fs::remove_file(&old).map_err(at(&old))?;
+    }
+    for (path, contents) in &state.makepkg {
+        let target = root.join(path.strip_prefix("/").expect("an absolute path"));
+        let parent = target.parent().expect("a path below root");
+        fs::create_dir_all(parent).map_err(at(parent))?;
+        write(&target, contents)?;
+    }
+    Ok(())
+}
+
+fn build(profile: &Profile, state: &HostState, name: &str, base: &Path) -> Result<(), String> {
     // SAFETY: geteuid has no preconditions.
     if unsafe { libc::geteuid() } != 0 {
-        return Err("qim image build must run as root (it bind-mounts /dev, /proc and /sys)".to_string());
+        return Err("building an image needs root (it bind-mounts /dev, /proc and /sys)".to_string());
     }
-    let profile = profiles::get(profile_name)?;
-    let name = name.map_or_else(|| format!("{}-{}", profile.name, date.compact()), str::to_string);
-    let base = images_dir()?.join(&name);
-    if base.exists() {
-        return Err(format!("image {name} already exists: {}", base.display()));
-    }
+    let images = images_dir()?;
+    fs::create_dir_all(&images).map_err(at(&images))?;
+    // Built aside and renamed when complete, so that a failed build leaves no image behind.
+    let building = TempDir::new(&images)?;
+    build_in(profile, state, name, building.path())?;
+    fs::rename(building.path(), base).map_err(at(base))
+}
+
+fn build_in(profile: &Profile, state: &HostState, name: &str, base: &Path) -> Result<(), String> {
     let root = base.join("root");
-    let pacman_db = root.join("var/lib/pacman");
-    fs::create_dir_all(&pacman_db).map_err(at(&pacman_db))?;
+    let sync_dir = root.join("var/lib/pacman/sync");
+    fs::create_dir_all(&sync_dir).map_err(at(&sync_dir))?;
+    for (file_name, contents) in &state.sync_dbs {
+        write(&sync_dir.join(OsStr::from_bytes(file_name)), contents)?;
+    }
     let cache_dir = home()?.join("pkg");
     fs::create_dir_all(&cache_dir).map_err(at(&cache_dir))?;
     let cache_dir_text = cache_dir.to_str().ok_or_else(|| format!("{}: not valid UTF-8", cache_dir.display()))?;
+    // qim's cache comes first, so downloads go there and not into the host's cache.
+    let cache_dirs = std::iter::once(cache_dir_text).chain(state.pacman.cache_dirs.iter().map(String::as_str));
     let build_conf = base.join("pacman.conf");
-    write(&build_conf, pacman_conf(date, Some(cache_dir_text)))?;
+    write(&build_conf, with_cache_dirs(&state.pacman.text, cache_dirs)?)?;
 
     {
         let _mounts = chroot_mounts(&root)?;
+        // No -y: the copied sync databases decide the versions.
         run(Command::new("pacman")
             .arg("--config")
             .arg(&build_conf)
             .arg("--root")
             .arg(&root)
-            .args(["-Sy", "--noconfirm"])
+            .args(["-S", "--noconfirm"])
             .args(profile.packages()))?;
-        write(&root.join("etc/pacman.conf"), pacman_conf(date, None))?;
+        write(&root.join("etc/pacman.conf"), &state.pacman.text)?;
         run(chroot(&root).args(["pacman-key", "--init"]))?;
         run(chroot(&root).args(["pacman-key", "--populate", "archlinux"]))?;
         // pacman-key starts gpg-agent; stop it so that its sockets do not end up in the image.
@@ -437,6 +480,7 @@ pub fn build(profile_name: &str, date: Date, name: Option<&str>) -> Result<PathB
                 fs::remove_file(&leftover).map_err(at(&leftover))?;
             }
         }
+        install_makepkg_conf(&root, state)?;
         configure(&root, profile)?;
         if !profile.setup.is_empty() {
             run_setup(&root, profile)?;
@@ -470,15 +514,14 @@ pub fn build(profile_name: &str, date: Date, name: Option<&str>) -> Result<PathB
         .arg(format!("{size_mib}M")))?;
     let kernel_version = kernel.parent().and_then(Path::file_name).expect("a kernel below a directory");
     let info = object(vec![
-        ("name", text(name.as_str())),
+        ("name", text(name)),
         ("profile", text(profile.name)),
-        ("date", text(date.to_string())),
+        ("host_state", text(state.digest(profile))),
         ("kernel", text(kernel_version.as_bytes())),
         ("packages", Json::List(packages.lines().map(text).collect())),
         ("manifest_sha256", text(hex(&Sha256::digest(manifest_json.as_bytes())))),
     ]);
-    write(&base.join("image.json"), json_file(&info, 2))?;
-    Ok(base)
+    write(&base.join("image.json"), json_file(&info, 2))
 }
 
 // --- Manifest --------------------------------------------------------------------
@@ -942,58 +985,63 @@ fn write_json_string(out: &mut String, bytes: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::run::TempDir;
 
-    fn date(year: u32, month: u32, day: u32) -> Date {
-        Date::new(year, month, day).unwrap()
+    const PACMAN_CONF: &str = "\
+[options]
+RootDir = /
+DBPath = /var/lib/pacman/
+CacheDir = /var/cache/pacman/pkg/
+CacheDir = /srv/pkg/
+HookDir = /etc/pacman.d/hooks/
+GPGDir = /etc/pacman.d/gnupg/
+LogFile = /var/log/pacman.log
+HoldPkg = pacman
+NoExtract = usr/share/doc/*
+Architecture = x86_64
+
+[core]
+Server = https://mirror.example/core/os/x86_64
+
+[extra]
+Server = https://mirror.example/extra/os/x86_64
+";
+
+    #[test]
+    fn the_guest_configuration_keeps_everything_but_the_host_paths() {
+        let conf = split_pacman_conf(PACMAN_CONF).unwrap();
+        assert_eq!(conf.text, "\
+[options]
+HoldPkg = pacman
+NoExtract = usr/share/doc/*
+Architecture = x86_64
+
+[core]
+Server = https://mirror.example/core/os/x86_64
+
+[extra]
+Server = https://mirror.example/extra/os/x86_64
+");
+        assert_eq!(conf.db_path, "/var/lib/pacman/");
+        assert_eq!(conf.cache_dirs, ["/var/cache/pacman/pkg/", "/srv/pkg/"]);
     }
 
     #[test]
-    fn servers_point_to_the_archive_of_the_date() {
-        let conf = pacman_conf(date(2026, 11, 8), None);
-        let server = "Server = https://archive.archlinux.org/repos/2026/11/08/$repo/os/$arch";
-        assert!(conf.contains(&format!("[core]\n{server}\n")));
-        assert!(conf.contains(&format!("[extra]\n{server}\n")));
+    fn path_like_keys_outside_options_are_kept() {
+        let conf = split_pacman_conf("[options]\nDBPath = /db/\n[custom]\nCacheDir = /x\nServer = file:///repo\n").unwrap();
+        assert_eq!(conf.text, "[options]\n[custom]\nCacheDir = /x\nServer = file:///repo\n");
+        assert!(conf.cache_dirs.is_empty());
     }
 
     #[test]
-    fn stalls_of_the_archive_do_not_abort_downloads() {
-        assert!(pacman_conf(date(2026, 11, 8), None).contains("[options]\nArchitecture = auto\nSigLevel = Required DatabaseOptional\nLocalFileSigLevel = Optional\nParallelDownloads = 5\nDisableDownloadTimeout\n"));
+    fn a_configuration_without_a_database_path_is_refused() {
+        assert!(split_pacman_conf("[options]\nArchitecture = x86_64\n").is_err());
     }
 
     #[test]
-    fn has_no_extraction_exclusions() {
-        assert!(!pacman_conf(date(2026, 11, 8), None).contains("NoExtract"));
-    }
-
-    #[test]
-    fn cache_dir_only_when_given() {
-        assert!(!pacman_conf(date(2026, 11, 8), None).contains("CacheDir"));
-        assert!(pacman_conf(date(2026, 11, 8), Some("/var/cache/qim")).contains("CacheDir = /var/cache/qim\n"));
-    }
-
-    #[test]
-    fn default_date_is_the_previous_day() {
-        assert_eq!(default_date(date(2026, 11, 9)), date(2026, 11, 8));
-        assert_eq!(default_date(date(2026, 3, 1)), date(2026, 2, 28));
-        assert_eq!(default_date(date(2024, 3, 1)), date(2024, 2, 29));
-        assert_eq!(default_date(date(2026, 1, 1)), date(2025, 12, 31));
-    }
-
-    #[test]
-    fn days_since_the_epoch_become_dates() {
-        assert_eq!(Date::from_days(0), date(1970, 1, 1));
-        assert_eq!(Date::from_days(11016), date(2000, 2, 29));
-        assert_eq!(Date::from_days(20766), date(2026, 11, 9));
-    }
-
-    #[test]
-    fn dates_are_iso_formatted_and_parsed() {
-        assert_eq!(Date::parse("2026-11-08"), Ok(date(2026, 11, 8)));
-        assert_eq!(date(2026, 11, 8).to_string(), "2026-11-08");
-        for invalid in ["2026-02-29", "2026-13-01", "2026-1-08", "20261108", "2026-11-08 ", "\u{ff12}026-11-08"] {
-            assert!(Date::parse(invalid).is_err(), "{invalid}");
-        }
+    fn cache_dirs_go_first_in_options_in_the_given_order() {
+        let conf = with_cache_dirs("[options]\nArchitecture = x86_64\n[core]\n", ["/qim/pkg", "/var/cache/pacman/pkg/"]).unwrap();
+        assert_eq!(conf, "[options]\nCacheDir = /qim/pkg\nCacheDir = /var/cache/pacman/pkg/\nArchitecture = x86_64\n[core]\n");
+        assert!(with_cache_dirs("[core]\n", ["/qim/pkg"]).is_err());
     }
 
     #[test]

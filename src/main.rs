@@ -8,7 +8,7 @@ use std::process::ExitCode;
 
 use clap::builder::PossibleValuesParser;
 use clap::{Parser, Subcommand};
-use qim::image::{self, Date};
+use qim::image;
 use qim::{audit, profiles, run};
 
 #[derive(Parser)]
@@ -27,9 +27,9 @@ enum Commands {
     },
     /// Run a command in a guest and collect what it did
     Run {
-        /// Base image name (see qim image build)
-        #[arg(long)]
-        image: String,
+        /// The guest's profile; its image for the host's current pacman state is built first if needed
+        #[arg(long, default_value = "default", value_parser = PossibleValuesParser::new(profiles::names()))]
+        profile: String,
         /// Output directory (must not exist)
         #[arg(long)]
         output: PathBuf,
@@ -61,16 +61,10 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum ImageCommand {
-    /// Build a base image from a dated Arch Linux Archive snapshot
+    /// Build the base image of a profile for the host's current pacman state (if it does not exist yet)
     Build {
         #[arg(long, default_value = "default", value_parser = PossibleValuesParser::new(profiles::names()))]
         profile: String,
-        /// Snapshot date YYYY-MM-DD (default: yesterday, UTC)
-        #[arg(long, value_parser = Date::parse)]
-        date: Option<Date>,
-        /// Image name (default: <profile>-<date>)
-        #[arg(long)]
-        name: Option<String>,
     },
 }
 
@@ -98,13 +92,13 @@ fn main() -> ExitCode {
 
 fn execute(command: Commands) -> Result<ExitCode, String> {
     match command {
-        Commands::Image { command: ImageCommand::Build { profile, date, name } } => {
-            let date = date.unwrap_or_else(|| image::default_date(Date::today()));
-            println!("{}", image::build(&profile, date, name.as_deref())?.display());
+        Commands::Image { command: ImageCommand::Build { profile } } => {
+            println!("{}", image::ensure(&profile)?.display());
             Ok(ExitCode::SUCCESS)
         }
-        Commands::Run { image: image_name, output, timeout, memory, cpus, command } => {
-            Ok(ExitCode::from(run::run(&image_name, &command, &output, timeout, memory, cpus)?))
+        Commands::Run { profile, output, timeout, memory, cpus, command } => {
+            let base = image::ensure(&profile)?;
+            Ok(ExitCode::from(run::run(&base, &command, &output, timeout, memory, cpus)?))
         }
         Commands::Convert { audit_log, dns, packets, output } => {
             let open = |path: &Path| {
