@@ -30,22 +30,23 @@ nftables. On other hosts, use the development container below.
 
     dev/podman build --tag qim-dev -f dev/Containerfile dev   # once
     dev/cargo test --release                                  # unit tests
-    dev/qim run --profile aur --output /work/out/tty-clock \
-        -- paru -S --noconfirm --skipreview tty-clock
+    dev/qim run --profile aur -- paru -S --noconfirm --skipreview tty-clock
 
 `dev/podman` keeps all container storage in `build/containers`, `dev/cargo`
 builds static musl binaries into `build/target`, and `dev/qim` builds qim and
 runs it in the container with the devices and capabilities it needs. Inside
-the container `/work` is `build/`, so the run above writes to
-`build/out/tty-clock`.
+the container `/work` is `build/` and qim's directory is `/work/qim`, so the
+run above writes to `build/qim/runs/<UTC time>` (qim prints the directory as
+`/work/qim/runs/...`).
 
 ## Commands
 
-- `qim run [--profile default|aur] --output DIR [--timeout S] [--memory MIB] [--cpus N] -- COMMAND...`
+- `qim run [--profile default|aur] [--output DIR] [--timeout S] [--memory MIB] [--cpus N] -- COMMAND...`
   boots the profile's base image read-only with a writable overlay, runs the
-  command (stdin is /dev/null) and writes the outputs to DIR. Its exit code
-  is the command's. When the host's pacman state has no image yet, it builds
-  one first.
+  command (stdin is /dev/null) and writes the outputs to DIR, by default
+  `runs/<UTC time>` in qim's directory (`$QIM_HOME`, or `~/.cache/qim`). Its
+  exit code is the command's. When the host's pacman state has no image yet,
+  it builds one first.
 - `qim image build [--profile default|aur]` builds that image ahead of time
   and prints its directory.
 
