@@ -253,7 +253,7 @@ pub(crate) fn run(command: &mut Command) -> Result<(), String> {
 }
 
 /// Run a command and return its standard output; its standard error is discarded.
-fn output(command: &mut Command) -> Result<Vec<u8>, String> {
+pub(crate) fn output(command: &mut Command) -> Result<Vec<u8>, String> {
     let mut child = spawn(command.stdout(Stdio::piped()).stderr(Stdio::null()))?;
     let mut stdout = Vec::new();
     let read = child.stdout.take().expect("stdout is piped").read_to_end(&mut stdout);

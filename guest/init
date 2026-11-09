@@ -198,6 +198,8 @@ for _ in 1 2 3; do
   done
   sleep 0.5
 done
+# The packages the command ran with, for the host to compare with its own.
+pacman -Q >/run/qim/meta/packages 2>/dev/null
 sync
 # /dev/kmsg is not in this root; dmesg falls back to syslog(2).
 dmesg >/run/qim/meta/dmesg 2>&1

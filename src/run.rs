@@ -37,6 +37,7 @@ const META_FILES: &[&str] = &[
     "meta/audit_reader_exit",
     "meta/samples",
     "meta/dmesg",
+    "meta/packages",
 ];
 
 /// shlex.quote: a word that the guest's shell reads back as `value`.
@@ -389,6 +390,9 @@ pub fn run(
     for problem in recording_problems(&output_dir.join("meta")) {
         eprintln!("qim: warning: the audit record may be incomplete: {problem}");
     }
+    for mismatch in host_mismatches(&output_dir.join("meta/packages"))? {
+        eprintln!("qim: warning: the guest differs from the host: {mismatch}");
+    }
     let exit_code = String::from_utf8_lossy(&exit_code);
     let code: i32 = exit_code
         .trim()
@@ -396,6 +400,51 @@ pub fn run(
         .map_err(|_| format!("{}: not an exit status: {exit_code:?}", exit_code_path.display()))?;
     // As a process exit status, only the low 8 bits count.
     Ok(code as u8)
+}
+
+/// Compare the guest's packages (meta/packages, `pacman -Q` at the end of the
+/// run) with the host's. The guest installs repository packages in the
+/// versions of the host's sync databases; when the host has another version of
+/// one installed, it has updates it has not applied, and what was built in the
+/// guest may need versions the host does not have.
+fn host_mismatches(guest_packages: &Path) -> Result<Vec<String>, String> {
+    let guest = match fs::read(guest_packages) {
+        Ok(guest) => guest,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(vec![format!("{} is missing", guest_packages.display())]);
+        }
+        Err(error) => return Err(at(guest_packages)(error)),
+    };
+    let installed = image::output(Command::new("pacman").arg("-Q"))?;
+    let sync = image::output(Command::new("pacman").arg("-Sl"))?;
+    Ok(version_mismatches(&String::from_utf8_lossy(&guest), &String::from_utf8_lossy(&installed), &String::from_utf8_lossy(&sync)))
+}
+
+/// Packages of the host's sync databases (`pacman -Sl` lines: repository,
+/// name, version) that the guest and the host (`pacman -Q` lines: name,
+/// version) both have, in different versions. Packages from no repository,
+/// such as the ones the command built, are left out: they may differ on purpose.
+pub fn version_mismatches(guest: &str, host_installed: &str, host_sync: &str) -> Vec<String> {
+    let pairs = |text: &str, skip: usize| -> HashMap<String, String> {
+        text.lines()
+            .filter_map(|line| {
+                let mut fields = line.split_whitespace().skip(skip);
+                Some((fields.next()?.to_string(), fields.next()?.to_string()))
+            })
+            .collect()
+    };
+    let installed = pairs(host_installed, 0);
+    let in_sync = pairs(host_sync, 1);
+    let mut mismatches: Vec<String> = pairs(guest, 0)
+        .into_iter()
+        .filter(|(name, _)| in_sync.contains_key(name))
+        .filter_map(|(name, version)| {
+            let host = installed.get(&name)?;
+            (host != &version).then(|| format!("{name} is {version} in the guest but {host} on the host"))
+        })
+        .collect();
+    mismatches.sort();
+    mismatches
 }
 
 /// Copy the audit records from the audit disk to audit.log.
@@ -839,5 +888,13 @@ mod tests {
         fs::write(directory.path().join("audit.log"), "not an audit record\n").unwrap();
         write_events(directory.path());
         assert!(!directory.path().join("events.json").exists());
+    }
+
+    #[test]
+    fn only_repository_packages_in_other_versions_on_the_host_are_mismatches() {
+        let guest = "glibc 2.42-1\nzlib 1:1.3.1-2\ntty-clock 2.3-2\ncurl 8.10-1\n";
+        let host_installed = "glibc 2.41-3\nzlib 1:1.3.1-2\ntty-clock 2.3-1\n";
+        let host_sync = "core glibc 2.42-1 [installed: 2.41-3]\ncore zlib 1:1.3.1-2 [installed]\ncore curl 8.10-1\n";
+        assert_eq!(version_mismatches(guest, host_installed, host_sync), ["glibc is 2.42-1 in the guest but 2.41-3 on the host"]);
     }
 }
